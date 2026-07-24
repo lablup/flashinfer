@@ -1065,11 +1065,25 @@ class _B12xRunner(MoERunner):
 
         experts = self.config.experts
         local_num_experts = experts.local_num_experts or self.config.routing.num_experts
-        if experts.local_expert_offset != 0 or (
-            local_num_experts != self.config.routing.num_experts
+        if local_num_experts < 1:
+            raise ValueError(
+                "b12x unified MoE requires local_num_experts >= 1, got "
+                f"{experts.local_num_experts}."
+            )
+        if experts.local_expert_offset < 0:
+            raise ValueError(
+                "b12x unified MoE requires local_expert_offset >= 0, got "
+                f"{experts.local_expert_offset}."
+            )
+        if (
+            experts.local_expert_offset + local_num_experts
+            > self.config.routing.num_experts
         ):
-            raise NotImplementedError(
-                "b12x unified MoE does not support expert parallelism."
+            raise ValueError(
+                "b12x unified MoE requires local_expert_offset + "
+                "local_num_experts <= num_experts "
+                f"({experts.local_expert_offset} + {local_num_experts} > "
+                f"{self.config.routing.num_experts})."
             )
         if not self.config.execution.do_finalize:
             raise NotImplementedError("b12x unified MoE requires do_finalize=True.")
@@ -1133,6 +1147,10 @@ class _B12xRunner(MoERunner):
             intermediate_size=self.config.experts.intermediate_size,
             use_cuda_graph=True,
             max_num_tokens=max(1, num_tokens),
+            num_local_experts=(
+                self.config.experts.local_num_experts or self.config.routing.num_experts
+            ),
+            local_expert_offset=self.config.experts.local_expert_offset,
             device=self.device,
             activation=self.activation,
             quant_mode=self._get_quant_mode_name(),
@@ -1145,10 +1163,13 @@ class _B12xRunner(MoERunner):
         v = weights.get_view(self.backend_key)
         self._validate_prepared_weights(v)
         first_weight = v[self.required_weight_keys[0]]
-        if first_weight.shape[0] != self.config.routing.num_experts:
+        local_num_experts = (
+            self.config.experts.local_num_experts or self.config.routing.num_experts
+        )
+        if first_weight.shape[0] != local_num_experts:
             raise ValueError(
                 f"{self.backend_key} prepared {first_weight.shape[0]} "
-                f"experts, expected {self.config.routing.num_experts}."
+                f"experts, expected {local_num_experts} (this rank's shard)."
             )
 
         hidden_states = act.hidden_states_q

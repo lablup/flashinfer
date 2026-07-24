@@ -1682,6 +1682,7 @@ def testB12xFusedMoe(args):
     num_experts = args.num_experts
     top_k = args.top_k
     local_num_experts = args.local_num_experts or num_experts
+    local_expert_offset = args.local_expert_offset
     is_cuda_graph_compatible = not args.no_cuda_graph
     res = []
 
@@ -1745,6 +1746,7 @@ def testB12xFusedMoe(args):
             num_experts=num_experts,
             top_k=top_k,
             num_local_experts=local_num_experts,
+            local_expert_offset=local_expert_offset,
             output=moe_output,
             activation=activation_str,
         )
@@ -1771,6 +1773,7 @@ def testB12xFusedMoe(args):
             use_cuda_graph=is_cuda_graph_compatible,
             max_num_tokens=num_tokens,
             num_local_experts=local_num_experts,
+            local_expert_offset=local_expert_offset,
             activation=activation_str,
         )
         runner = moe.run
@@ -1814,8 +1817,16 @@ def testB12xFusedMoe(args):
     )
 
     # Snapshot active expert count before any kernel execution, since
-    # autotune tactic exploration may corrupt input tensors.
-    num_active_experts = int(tensors["token_selected_experts"].unique().numel())
+    # autotune tactic exploration may corrupt input tensors. Under EP only
+    # ids inside this rank's shard reach the kernel; count those so the
+    # bandwidth model reads shard-local weight traffic, and record the
+    # fraction of routed pairs actually computed for TFLOPS normalization.
+    _ids = tensors["token_selected_experts"]
+    _local_ids = _ids[
+        (_ids >= local_expert_offset) & (_ids < local_expert_offset + local_num_experts)
+    ]
+    num_active_experts = int(_local_ids.unique().numel())
+    ep_compute_fraction = _local_ids.numel() / max(1, _ids.numel())
 
     backend = "b12x"
 
@@ -1850,14 +1861,20 @@ def testB12xFusedMoe(args):
     # Compute performance metrics
     median_time = np.median(times)
     std_time = np.std(times)
-    tflops = calculate_moe_tflops(
-        num_tokens,
-        hidden_size,
-        intermediate_size,
-        num_experts,
-        top_k,
-        median_time,
-        is_gated=is_gated,
+    # Scale by the locally computed pair fraction: an EP shard only runs
+    # FLOPs for routed pairs inside [offset, offset + local); the raw
+    # formula counts all num_tokens * top_k pairs.
+    tflops = (
+        calculate_moe_tflops(
+            num_tokens,
+            hidden_size,
+            intermediate_size,
+            num_experts,
+            top_k,
+            median_time,
+            is_gated=is_gated,
+        )
+        * ep_compute_fraction
     )
     # Input format is bf16 for b12x (kernel fuses quantization), weights are nvfp4.
     tb_per_sec = calculate_moe_kernel_bandwidth(
@@ -1893,6 +1910,8 @@ def testB12xFusedMoe(args):
         cur_res["num_experts"] = num_experts
         cur_res["top_k"] = top_k
         cur_res["local_num_experts"] = local_num_experts
+        cur_res["local_expert_offset"] = local_expert_offset
+        cur_res["ep_compute_fraction"] = ep_compute_fraction
         cur_res["input_dtype"] = input_dtype
         cur_res["weight_dtype"] = weight_dtype
         cur_res["fp4_mode"] = "nvfp4"

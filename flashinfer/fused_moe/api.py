@@ -474,6 +474,46 @@ class B12xNvfp4Config:
             device=device,
         )
 
+    @staticmethod
+    def prepare_packed_weights(
+        w1_fp4,
+        w1_blockscale,
+        w1_global_scale,
+        w2_fp4,
+        w2_blockscale,
+        w2_global_scale,
+        *,
+        activation: ActivationConfig = ActivationConfig.swiglu,
+        source_format: str = "modelopt",
+        a1_input_global_scale=None,
+        a2_input_global_scale=None,
+        w13_checkpoint_order: str = "up_gate",
+    ):
+        """Build the ``b12x_nvfp4`` weight view from packed checkpoint tensors.
+
+        Ingests already-quantized FP4 checkpoints (ModelOpt or
+        compressed-tensors ``nvfp4-pack-quantized``) and translates the scale
+        conventions into kernel form. Register the result with
+        ``MoEWeightPack.prepare_for("b12x_nvfp4", ...)``. See
+        :func:`flashinfer.fused_moe.prepare.prepare_b12x_nvfp4_packed_weights`.
+        """
+        from .prepare import prepare_b12x_nvfp4_packed_weights
+        from .utils import get_b12x_activation_name
+
+        return prepare_b12x_nvfp4_packed_weights(
+            w1_fp4,
+            w1_blockscale,
+            w1_global_scale,
+            w2_fp4,
+            w2_blockscale,
+            w2_global_scale,
+            activation=get_b12x_activation_name(activation.type),
+            source_format=source_format,
+            a1_input_global_scale=a1_input_global_scale,
+            a2_input_global_scale=a2_input_global_scale,
+            w13_checkpoint_order=w13_checkpoint_order,
+        )
+
     def __repr__(self) -> str:
         return "B12xNvfp4Config()"
 

@@ -81,20 +81,22 @@ def test_b12x_reference_uses_activation_precision_and_fc2_scale():
             activation_precision="fp4",
         )
 
-    with pytest.raises(ValueError, match=r"compressed_tensors.*w4a16"):
-        b12x_fused_moe_trace.reference(
-            **common_kwargs,
-            fc2_input_scale=torch.ones((1,), dtype=torch.float32),
-            quant_mode="nvfp4",
-            source_format="compressed_tensors",
-        )
-
     fp4 = b12x_fused_moe_trace.reference(
         **common_kwargs,
         fc2_input_scale=torch.ones((1,), dtype=torch.float32),
         activation_precision="fp4",
     )
 
+    # nvfp4 accepts source_format='compressed_tensors' as pass-through
+    # provenance metadata (no numeric effect at the reference level either).
+    fp4_ct = b12x_fused_moe_trace.reference(
+        **common_kwargs,
+        fc2_input_scale=torch.ones((1,), dtype=torch.float32),
+        quant_mode="nvfp4",
+        source_format="compressed_tensors",
+    )
+
     assert fp4.shape == bf16.shape
     assert torch.equal(wrapper_bf16, bf16)
     assert not torch.equal(fp4, bf16)
+    assert torch.equal(fp4_ct, fp4)

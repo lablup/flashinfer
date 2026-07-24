@@ -281,12 +281,30 @@ class MoEDynamicKernel:
         swiglu_beta: float = 1.0,
         swiglu_limit: float | None = None,
         share_input_across_experts: bool = False,
+        local_expert_offset: int = 0,
     ):
         if activation not in {"silu", "relu2", "gelu_tanh", "swigluoai_uninterleave"}:
             raise ValueError(f"unsupported activation {activation!r}")
+        if local_expert_offset < 0:
+            raise ValueError(
+                f"local_expert_offset must be >= 0, got {local_expert_offset}"
+            )
+        if local_expert_offset != 0 and share_input_across_experts:
+            # The shared-input route path records one slot per topk pair in
+            # shared memory with no invalid-slot sentinel, so it cannot drop
+            # non-local pairs. Dispatch gates it off under EP.
+            raise ValueError(
+                "share_input_across_experts is not supported with "
+                "expert parallelism (local_expert_offset != 0)."
+            )
         self._dense_cls = DenseGemmKernel
         self.acc_dtype = cutlass.Float32
         self.sf_vec_size = sf_vec_size
+        # Expert-parallel shard start in the global expert space (compile
+        # time, like the static kernel). Histogram and pack shift routed ids
+        # by this and drop ids outside [0, num_experts) where num_experts is
+        # the compile-time local shard width (row_counts.shape[0]).
+        self.local_expert_offset = int(local_expert_offset)
         self.input_scales_are_reciprocal = input_scales_are_reciprocal
         self.fast_math = fast_math
         self.activation = activation
@@ -1021,11 +1039,17 @@ class MoEDynamicKernel:
             is_cta_leader,
         )
 
-        # Phase 1: histogram routed rows per expert.
+        # Phase 1: histogram routed rows per expert. Ids are shifted into
+        # the local shard space; non-local pairs (EP) are not counted, so
+        # they produce no physical tiles and no tasks downstream.
         hist_idx = flat_tid
         while hist_idx < total_pairs:
-            expert_id = topk_ids[hist_idx].to(Int32)
-            atomic_add_global_i32(get_ptr_as_int64(row_counts, expert_id), Int32(1))
+            expert_id = topk_ids[hist_idx].to(Int32) - Int32(self.local_expert_offset)
+            if expert_id >= Int32(0):
+                if expert_id < num_experts:
+                    atomic_add_global_i32(
+                        get_ptr_as_int64(row_counts, expert_id), Int32(1)
+                    )
             hist_idx += flat_stride
 
         self._resident_grid_barrier(
@@ -1309,117 +1333,148 @@ class MoEDynamicKernel:
                         row = Int32(0)
                         phys_tile = Int32(0)
                         if pair_idx < total_pairs:
-                            expert_id = topk_ids[pair_idx].to(Int32)
+                            expert_id = topk_ids[pair_idx].to(Int32) - Int32(
+                                self.local_expert_offset
+                            )
                             token_idx = pair_idx // num_topk
                             weight = topk_weights[pair_idx].to(cutlass.Float32)
-
-                            if lane_id == Int32(0):
-                                row = atomic_add_global_i32(
-                                    get_ptr_as_int64(expert_write_rows, expert_id),
-                                    Int32(1),
-                                )
-                                phys_tile = expert_tile_base[expert_id] + row // Int32(
-                                    self.tile_shape_mnk[0]
-                                )
-                                phys_row = phys_tile * Int32(
-                                    self.tile_shape_mnk[0]
-                                ) + row % Int32(self.tile_shape_mnk[0])
-                                st_global_i32(
-                                    get_ptr_as_int64(token_map, phys_row), token_idx
-                                )
-                                st_global_f32(
-                                    get_ptr_as_int64(token_weights, phys_row), weight
-                                )
-
-                            row = cute.arch.shuffle_sync(row, Int32(0))
-                            phys_tile = cute.arch.shuffle_sync(phys_tile, Int32(0))
-                            expert_id = cute.arch.shuffle_sync(expert_id, Int32(0))
-                            token_idx = cute.arch.shuffle_sync(token_idx, Int32(0))
-
-                            gs_value = input_global_scale[expert_id].to(cutlass.Float32)
-                            if (
-                                self.input_scales_are_reciprocal
-                                and gs_value != cutlass.Float32(0.0)
-                            ):
-                                if self.fast_math:
-                                    gs_value = rcp_approx_ftz(gs_value)
-                                else:
-                                    gs_value = cutlass.Float32(1.0) / gs_value
-                            sf_idx = lane_id
-                            while sf_idx < sf_blocks_per_row:
-                                block_start = sf_idx * Int32(16)
-                                values = cute.make_rmem_tensor((16,), cutlass.Float32)
-                                block_max = cutlass.Float32(0.0)
-                                for elem_idx in cutlass.range_constexpr(16):
-                                    value = cutlass.Float32(
-                                        a_input[
-                                            token_idx, block_start + Int32(elem_idx)
-                                        ]
-                                    )
-                                    values[elem_idx] = value
-                                    block_max = fmax_f32(block_max, fabs_f32(value))
-                                packed64 = Uint64(0)
-                                scale_byte = Uint8(0)
-                                if self.fast_math:
-                                    packed64, scale_byte = quantize_block_fp4_fast(
-                                        values, block_max, gs_value
-                                    )
-                                else:
-                                    packed64, scale_byte = quantize_block_fp4(
-                                        values, block_max, gs_value
-                                    )
-
-                                output_offset = (
-                                    phys_tile * Int32(self.tile_shape_mnk[0])
-                                    + row % Int32(self.tile_shape_mnk[0])
-                                ) * output_bytes_per_row + sf_idx * Int32(8)
-                                st_global_u64(
-                                    get_ptr_as_int64(packed_a_storage, output_offset),
-                                    packed64,
-                                )
-
-                                k_tile_idx = sf_idx // Int32(4)
-                                outer_m_idx = row % Int32(32)
-                                inner_m_idx = (row % Int32(32 * 4)) // Int32(32)
-                                inner_k_idx = sf_idx % Int32(4)
-                                scale_offset = (
-                                    phys_tile * num_k_tiles * Int32(32 * 4 * 4)
-                                    + k_tile_idx * Int32(32 * 4 * 4)
-                                    + outer_m_idx * Int32(4 * 4)
-                                    + inner_m_idx * Int32(4)
-                                    + inner_k_idx
-                                )
-                                scale_storage[scale_offset] = scale_byte
-                                sf_idx += Int32(32)
-
-                            if full_tile_publish_enabled > Int32(0):
-                                cute.arch.sync_warp()
-                                # When the whole launch has fewer than one M-tile of routed
-                                # rows, only the final partial-tile flush can publish work.
-                                # Skip the per-row fence/counter path in that common micro case.
-                                _threadfence()
-                                cute.arch.sync_warp()
-
-                                if lane_id == Int32(0):
-                                    completed = atomic_add_global_i32(
-                                        get_ptr_as_int64(tile_write_count, phys_tile),
-                                        Int32(1),
-                                    ) + Int32(1)
-                                    if completed == Int32(self.tile_shape_mnk[0]):
-                                        self._publish_ready_tasks(
-                                            task_tail,
-                                            task_ready,
-                                            task_expert,
-                                            task_m_tile,
-                                            task_slice_begin,
-                                            task_slice_count,
-                                            task_valid_rows,
-                                            route_gate_tile_cnt,
-                                            task_slice_chunk,
-                                            expert_id,
-                                            phys_tile,
-                                            Int32(self.tile_shape_mnk[0]),
+                            # Non-local pair (EP): never claimed a row in
+                            # the histogram, so skip pack entirely. The
+                            # guard is warp-uniform (pair_idx is per-warp).
+                            if expert_id >= Int32(0):
+                                if expert_id < num_experts:
+                                    if lane_id == Int32(0):
+                                        row = atomic_add_global_i32(
+                                            get_ptr_as_int64(
+                                                expert_write_rows, expert_id
+                                            ),
+                                            Int32(1),
                                         )
+                                        phys_tile = expert_tile_base[
+                                            expert_id
+                                        ] + row // Int32(self.tile_shape_mnk[0])
+                                        phys_row = phys_tile * Int32(
+                                            self.tile_shape_mnk[0]
+                                        ) + row % Int32(self.tile_shape_mnk[0])
+                                        st_global_i32(
+                                            get_ptr_as_int64(token_map, phys_row),
+                                            token_idx,
+                                        )
+                                        st_global_f32(
+                                            get_ptr_as_int64(token_weights, phys_row),
+                                            weight,
+                                        )
+
+                                    row = cute.arch.shuffle_sync(row, Int32(0))
+                                    phys_tile = cute.arch.shuffle_sync(
+                                        phys_tile, Int32(0)
+                                    )
+                                    expert_id = cute.arch.shuffle_sync(
+                                        expert_id, Int32(0)
+                                    )
+                                    token_idx = cute.arch.shuffle_sync(
+                                        token_idx, Int32(0)
+                                    )
+
+                                    gs_value = input_global_scale[expert_id].to(
+                                        cutlass.Float32
+                                    )
+                                    if (
+                                        self.input_scales_are_reciprocal
+                                        and gs_value != cutlass.Float32(0.0)
+                                    ):
+                                        if self.fast_math:
+                                            gs_value = rcp_approx_ftz(gs_value)
+                                        else:
+                                            gs_value = cutlass.Float32(1.0) / gs_value
+                                    sf_idx = lane_id
+                                    while sf_idx < sf_blocks_per_row:
+                                        block_start = sf_idx * Int32(16)
+                                        values = cute.make_rmem_tensor(
+                                            (16,), cutlass.Float32
+                                        )
+                                        block_max = cutlass.Float32(0.0)
+                                        for elem_idx in cutlass.range_constexpr(16):
+                                            value = cutlass.Float32(
+                                                a_input[
+                                                    token_idx,
+                                                    block_start + Int32(elem_idx),
+                                                ]
+                                            )
+                                            values[elem_idx] = value
+                                            block_max = fmax_f32(
+                                                block_max, fabs_f32(value)
+                                            )
+                                        packed64 = Uint64(0)
+                                        scale_byte = Uint8(0)
+                                        if self.fast_math:
+                                            packed64, scale_byte = (
+                                                quantize_block_fp4_fast(
+                                                    values, block_max, gs_value
+                                                )
+                                            )
+                                        else:
+                                            packed64, scale_byte = quantize_block_fp4(
+                                                values, block_max, gs_value
+                                            )
+
+                                        output_offset = (
+                                            phys_tile * Int32(self.tile_shape_mnk[0])
+                                            + row % Int32(self.tile_shape_mnk[0])
+                                        ) * output_bytes_per_row + sf_idx * Int32(8)
+                                        st_global_u64(
+                                            get_ptr_as_int64(
+                                                packed_a_storage, output_offset
+                                            ),
+                                            packed64,
+                                        )
+
+                                        k_tile_idx = sf_idx // Int32(4)
+                                        outer_m_idx = row % Int32(32)
+                                        inner_m_idx = (row % Int32(32 * 4)) // Int32(32)
+                                        inner_k_idx = sf_idx % Int32(4)
+                                        scale_offset = (
+                                            phys_tile * num_k_tiles * Int32(32 * 4 * 4)
+                                            + k_tile_idx * Int32(32 * 4 * 4)
+                                            + outer_m_idx * Int32(4 * 4)
+                                            + inner_m_idx * Int32(4)
+                                            + inner_k_idx
+                                        )
+                                        scale_storage[scale_offset] = scale_byte
+                                        sf_idx += Int32(32)
+
+                                    if full_tile_publish_enabled > Int32(0):
+                                        cute.arch.sync_warp()
+                                        # When the whole launch has fewer than one M-tile of routed
+                                        # rows, only the final partial-tile flush can publish work.
+                                        # Skip the per-row fence/counter path in that common micro case.
+                                        _threadfence()
+                                        cute.arch.sync_warp()
+
+                                        if lane_id == Int32(0):
+                                            completed = atomic_add_global_i32(
+                                                get_ptr_as_int64(
+                                                    tile_write_count, phys_tile
+                                                ),
+                                                Int32(1),
+                                            ) + Int32(1)
+                                            if completed == Int32(
+                                                self.tile_shape_mnk[0]
+                                            ):
+                                                self._publish_ready_tasks(
+                                                    task_tail,
+                                                    task_ready,
+                                                    task_expert,
+                                                    task_m_tile,
+                                                    task_slice_begin,
+                                                    task_slice_count,
+                                                    task_valid_rows,
+                                                    route_gate_tile_cnt,
+                                                    task_slice_chunk,
+                                                    expert_id,
+                                                    phys_tile,
+                                                    Int32(self.tile_shape_mnk[0]),
+                                                )
                         warp_item += Int32(1)
 
         cute.arch.sync_threads()

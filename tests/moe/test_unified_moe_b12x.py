@@ -197,7 +197,7 @@ class TestB12xUnifiedValidation:
         with pytest.raises(error, match=match):
             self._runner(config).check_support()
 
-    def test_b12x_does_not_support_expert_parallelism(self, monkeypatch):
+    def test_b12x_accepts_valid_expert_parallel_shard(self, monkeypatch):
         config = self._config(
             B12xNvfp4Config(),
             QuantVariant.NVFP4,
@@ -208,8 +208,32 @@ class TestB12xUnifiedValidation:
             ),
         )
         self._mock_environment(monkeypatch)
+        # A valid contiguous shard is supported (EP: partial-sum output,
+        # caller reduces across ranks).
+        self._runner(config).check_support()
+
+    @pytest.mark.parametrize(
+        "experts_kwargs,match",
+        [
+            (
+                dict(local_expert_offset=6, local_num_experts=4),
+                r"local_expert_offset \+ local_num_experts",
+            ),
+            (dict(local_expert_offset=-1), r"local_expert_offset >= 0"),
+            (dict(local_num_experts=-2), r"local_num_experts >= 1"),
+        ],
+    )
+    def test_b12x_rejects_invalid_expert_parallel_shard(
+        self, monkeypatch, experts_kwargs, match
+    ):
+        config = self._config(
+            B12xNvfp4Config(),
+            QuantVariant.NVFP4,
+            experts=ExpertConfig(intermediate_size=512, **experts_kwargs),
+        )
+        self._mock_environment(monkeypatch)
         runner = self._runner(config)
-        with pytest.raises(NotImplementedError, match="expert parallelism"):
+        with pytest.raises(ValueError, match=match):
             runner.check_support()
 
     def test_b12x_does_not_support_unfinalized_output(self, monkeypatch):

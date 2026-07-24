@@ -15,17 +15,16 @@ from .moe_w4a16_host import (
     unswizzle_expert_scales,
     validate_w4a16_packed_inputs,
 )
+from .moe_source_format import (  # noqa: F401  (re-exported for compatibility)
+    _SOURCE_FORMATS,
+    _normalize_source_format,
+    _source_global_scale,
+)
 
 
 _PACKED_TILE_SIZE = 16
 _PACKED_TILE_N_SIZE = 64
 _PACK_FACTOR_4BIT = 8
-_SOURCE_FORMATS = {
-    "modelopt": "modelopt",
-    "compressed_tensors": "compressed_tensors",
-    "compressed-tensors": "compressed_tensors",
-    "ct": "compressed_tensors",
-}
 
 
 @dataclass(frozen=True)
@@ -131,24 +130,6 @@ def _process_nvfp4_packed_global_scale(
     fp4_exponent = 2
     exponent_bias = 2 ** (target_exponent - 1) - 2 ** (fp4_exponent - 1)
     return global_scale * (2.0 ** (exponent_bias - 7))
-
-
-def _normalize_source_format(source_format: str) -> str:
-    try:
-        return _SOURCE_FORMATS[source_format.lower()]
-    except KeyError as exc:
-        raise ValueError(
-            "source_format must be one of 'modelopt' or 'compressed_tensors', "
-            f"got {source_format!r}"
-        ) from exc
-
-
-def _source_global_scale(
-    global_scale: torch.Tensor, *, source_format: str
-) -> torch.Tensor:
-    if source_format == "compressed_tensors":
-        return (1.0 / global_scale).to(torch.float32).contiguous()
-    return global_scale.contiguous()
 
 
 def _repack_4bit_no_perm(

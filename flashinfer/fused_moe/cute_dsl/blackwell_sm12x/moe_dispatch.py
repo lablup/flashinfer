@@ -39,9 +39,9 @@ from .moe_w4a16_host import (
 from .moe_w4a16_kernel import run_w4a16_moe
 from .moe_w4a16_prepare import (
     W4A16PackedWeights,
-    _normalize_source_format,
     prepare_w4a16_packed_weights,
 )
+from .moe_source_format import _normalize_source_format
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -59,6 +59,11 @@ _MICRO_SHARE_INPUT_ACROSS_EXPERTS = (
 # Micro kernel cutover thresholds (routed pairs)
 _MICRO_COMPACT_CUTOVER_PAIRS = 20
 _MICRO_COMPACT_CUTOVER_PAIRS_MULTI_TOPK = 40
+# The Triton compact pre-pass builds BLOCK x BLOCK dedup matrices in one CTA
+# with BLOCK = next_pow2(total_pairs); Triton caps tensors at 2^20 elements,
+# so the pre-pass hard-fails above 1024 GLOBAL pairs. EP shards admit micro
+# by EXPECTED-local pairs, so the global count must be bounded separately.
+_MICRO_PREPASS_MAX_PAIRS = 1024
 _STATIC_COMPACT_CUTOVER_PAIRS_DEFAULT = 640
 _STATIC_COMPACT_CUTOVER_PAIRS = _STATIC_COMPACT_CUTOVER_PAIRS_DEFAULT
 _STATIC_COMPACT_CUTOVER_PAIRS_CACHE: Dict[str, int] = {}
@@ -170,12 +175,18 @@ def _activation_precision_from_quant_mode(quant_mode: str) -> str:
 
 
 def _normalize_source_format_for_quant_mode(source_format: str, quant_mode: str) -> str:
-    normalized = _normalize_source_format(source_format)
-    if quant_mode == "nvfp4" and normalized == "compressed_tensors":
-        raise ValueError(
-            "source_format='compressed_tensors' requires quant_mode='w4a16'."
-        )
-    return normalized
+    """Normalize ``source_format`` aliases for a given quant mode.
+
+    For ``quant_mode='w4a16'`` the value selects the checkpoint-scale
+    translation applied by the W4A16 prepare path. For ``quant_mode='nvfp4'``
+    it is accepted as pass-through provenance metadata: the nvfp4 launch
+    path performs NO numeric translation, and tensors must already be in
+    kernel convention (see ``launch_sm120_moe``). Convention translation for
+    raw checkpoints lives in
+    ``flashinfer.fused_moe.prepare.prepare_b12x_nvfp4_packed_weights``.
+    """
+    del quant_mode  # accepted for all quant modes; kept for call-site clarity
+    return _normalize_source_format(source_format)
 
 
 def _is_w4a16(activation_precision: str) -> bool:
@@ -217,6 +228,44 @@ def _get_static_compact_cutover_pairs(activation_precision: str = "fp4") -> int:
         cached = max(0, int(cutover))
     _STATIC_COMPACT_CUTOVER_PAIRS_CACHE[activation_precision] = cached
     return cached
+
+
+_MICRO_CUTOVER_PAIRS_CACHE: Dict[bool, int] = {}
+
+
+def _get_micro_compact_cutover_pairs(top_k: int) -> int:
+    """Micro/static cutover in routed pairs, overridable via
+    ``FLASHINFER_B12X_MICRO_CUTOVER_PAIRS`` (applies to both top-k regimes)."""
+    multi = top_k > 1
+    cached = _MICRO_CUTOVER_PAIRS_CACHE.get(multi)
+    if cached is not None:
+        return cached
+    override = os.environ.get("FLASHINFER_B12X_MICRO_CUTOVER_PAIRS")
+    if override is not None:
+        cached = max(0, int(override))
+    else:
+        cached = (
+            _MICRO_COMPACT_CUTOVER_PAIRS_MULTI_TOPK
+            if multi
+            else _MICRO_COMPACT_CUTOVER_PAIRS
+        )
+    _MICRO_CUTOVER_PAIRS_CACHE[multi] = cached
+    return cached
+
+
+def _expected_local_pairs(
+    routed_rows: int, num_local_experts: int, num_experts: int
+) -> int:
+    """Expected routed pairs landing on this rank's shard.
+
+    The tuning ladders / cutovers were profiled on full-width pair counts;
+    an EP shard computes only ~(num_local/num_experts) of the global pairs
+    (uniform-routing expectation), so heuristics should see that count.
+    Exact per-call counts live on-device only (row_counts).
+    """
+    if num_experts <= 0 or num_local_experts >= num_experts:
+        return routed_rows
+    return max(1, (routed_rows * num_local_experts) // num_experts)
 
 
 def _select_moe_mma_tiler_mn(routed_rows: int, n: int) -> Tuple[int, int]:
@@ -309,6 +358,19 @@ def allocate_sm120_static_workspace(
 
     rows_pad_k = _align_up(max_rows, 128)
     cols_pad_k = _align_up(k // _NVFP4_BLOCK_SIZE, 4)
+    # The static kernel computes packed-A byte offsets in Int32
+    # (local_expert_id * max_rows * k/2 + ...), so the expert-major
+    # activation store must stay below 2 GiB. Larger routed workloads belong
+    # on the dynamic backend (compact tiles, O(routed_rows) storage).
+    packed_bytes = state_E * max_rows * (k // 2)
+    if packed_bytes >= 2**31:
+        raise ValueError(
+            "static SM120 MoE workspace packed-A store would be "
+            f"{packed_bytes / 2**30:.1f} GiB (state_E={state_E} * "
+            f"max_rows={max_rows} * {k // 2} B), exceeding the kernel's "
+            "Int32 offset range; use the dynamic backend (or fewer routed "
+            "rows) for this shape."
+        )
     packed_input = torch.empty(
         state_E, max_rows, k // 2, dtype=torch.uint8, device=device
     )
@@ -504,6 +566,7 @@ def _get_static_kernel(
     swiglu_beta: float = 1.0,
     swiglu_limit: float | None = None,
     activation_precision: str = "fp4",
+    local_expert_offset: int = 0,
 ):
     """Compile (or retrieve cached) the SM120 static MoE kernel."""
     activation_precision = _normalize_activation_precision(activation_precision)
@@ -544,6 +607,7 @@ def _get_static_kernel(
         swiglu_alpha,
         swiglu_beta,
         swiglu_limit,
+        local_expert_offset,
     )
     cached = _STATIC_KERNEL_CACHE.get(cache_key)
     if cached is not None:
@@ -566,6 +630,7 @@ def _get_static_kernel(
         swiglu_beta=swiglu_beta,
         swiglu_limit=swiglu_limit,
         input_scales_are_reciprocal=input_scales_are_reciprocal,
+        local_expert_offset=local_expert_offset,
     )
 
     is_gated = is_gated_activation(activation)
@@ -656,25 +721,29 @@ def _get_static_kernel(
         (weight_E,),
         assumed_align=4,
     )
+    # Per-expert fp32 scale vectors are only ever read as scalars in-kernel,
+    # so 4-byte alignment suffices. Under EP callers pass dim-0 slices of the
+    # full-model tensors (base + 4*local_expert_offset); assumed_align=16
+    # would make the compiled entry reject any offset not divisible by 4.
     input_gs_fake = cute.runtime.make_fake_compact_tensor(
         alpha_dtype,
         (weight_E,),
-        assumed_align=16,
+        assumed_align=4,
     )
     alpha_fake = cute.runtime.make_fake_compact_tensor(
         alpha_dtype,
         (weight_E,),
-        assumed_align=16,
+        assumed_align=4,
     )
     down_alpha_fake = cute.runtime.make_fake_compact_tensor(
         alpha_dtype,
         (weight_E,),
-        assumed_align=16,
+        assumed_align=4,
     )
     global_scale_fake = cute.runtime.make_fake_compact_tensor(
         alpha_dtype,
         (weight_E,),
-        assumed_align=16,
+        assumed_align=4,
     )
     scatter_fake = cute.runtime.make_fake_compact_tensor(
         a_dtype,
@@ -901,25 +970,27 @@ def _get_micro_kernel(
         (weight_E,),
         assumed_align=4,
     )
+    # Per-expert fp32 scales are scalar-read; align=4 accepts EP dim-0
+    # slices (see the static-kernel fakes for the rationale).
     input_gs_fake = cute.runtime.make_fake_compact_tensor(
         alpha_dtype,
         (weight_E,),
-        assumed_align=16,
+        assumed_align=4,
     )
     alpha_fake = cute.runtime.make_fake_compact_tensor(
         alpha_dtype,
         (weight_E,),
-        assumed_align=16,
+        assumed_align=4,
     )
     down_alpha_fake = cute.runtime.make_fake_compact_tensor(
         alpha_dtype,
         (weight_E,),
-        assumed_align=16,
+        assumed_align=4,
     )
     global_scale_fake = cute.runtime.make_fake_compact_tensor(
         alpha_dtype,
         (weight_E,),
-        assumed_align=16,
+        assumed_align=4,
     )
     scatter_fake = cute.runtime.make_fake_compact_tensor(
         a_dtype,
@@ -1000,6 +1071,8 @@ def launch_sm120_static_moe(
     k: int,
     n: int,
     top_k: int,
+    num_local_experts: int | None = None,
+    local_expert_offset: int = 0,
     input_scales_are_reciprocal: bool = False,
     fast_math: bool = True,
     activation: str = "silu",
@@ -1010,14 +1083,31 @@ def launch_sm120_static_moe(
 ) -> torch.Tensor:
     """Launch the SM120 static or micro MoE kernel.
 
-    Selects the micro kernel for tiny decode batches (routed_rows <= 20-40)
-    and the static kernel otherwise. The micro path runs a Triton pre-pass
-    to compact routing IDs before launching.
+    Selects the micro kernel for tiny decode batches (expected local pairs
+    <= 20-40) and the static kernel otherwise. The micro path runs a Triton
+    pre-pass to compact routing IDs before launching.
+
+    Under expert parallelism (num_local_experts < num_experts) both kernels
+    filter to this rank's shard: the static kernel shifts routed ids by
+    local_expert_offset in-kernel, while the micro path always takes the
+    Triton compact pre-pass, which shifts ids and emits -1 for non-local
+    pairs (the single-token shortcuts and the shared-input specialization
+    bypass filtering and are disabled on shards).
     """
     activation_precision = _normalize_activation_precision(activation_precision)
     if activation_precision == "bf16":
         raise ValueError(
             "internal routing error: quant_mode='w4a16' reached the NVFP4 static launcher"
+        )
+    if num_local_experts is None:
+        num_local_experts = num_experts
+    is_ep = num_local_experts != num_experts or local_expert_offset != 0
+    if workspace.weight_E != num_local_experts:
+        raise ValueError(
+            "static SM120 MoE workspace weight_E "
+            f"({workspace.weight_E}) does not match num_local_experts "
+            f"({num_local_experts}); allocate the workspace with "
+            "weight_E=num_local_experts."
         )
 
     # Flatten routing tensors
@@ -1031,30 +1121,38 @@ def launch_sm120_static_moe(
     input_gs_is_shared = input_gs.numel() == 1
     down_input_scale_is_shared = down_input_scale.numel() == 1
 
-    # Broadcast scalar scales to per-expert [E] tensors
-    input_gs = _expand_to_experts(input_gs, num_experts)
-    down_input_scale = _expand_to_experts(down_input_scale, num_experts)
+    # Broadcast scalar scales to per-expert tensors sized to the weight
+    # tensors' expert count (this rank's shard under EP).
+    input_gs = _expand_to_experts(input_gs, num_local_experts)
+    down_input_scale = _expand_to_experts(down_input_scale, num_local_experts)
 
-    # Decide micro vs static
-    micro_cutover = _MICRO_COMPACT_CUTOVER_PAIRS
-    if top_k > 1:
-        micro_cutover = _MICRO_COMPACT_CUTOVER_PAIRS_MULTI_TOPK
-    use_micro = activation_precision == "fp4" and routed_rows <= micro_cutover
+    # Decide micro vs static, on the shard-local expected pair count (equal
+    # to routed_rows when not expert-parallel). EP micro runs through the
+    # Triton compact pre-pass, which drops non-local pairs (-1 sentinel).
+    effective_pairs = _expected_local_pairs(routed_rows, num_local_experts, num_experts)
+    micro_cutover = _get_micro_compact_cutover_pairs(top_k)
+    use_micro = (
+        activation_precision == "fp4"
+        and effective_pairs <= micro_cutover
+        and routed_rows <= _MICRO_PREPASS_MAX_PAIRS
+    )
 
     sm_count = get_num_sm(torch.device("cuda"))
     base_mac = min(get_max_active_clusters(1), sm_count)
-    tuned_static_mac = _lookup_mac_ladder(_STATIC_MAC_LADDER, routed_rows)
+    tuned_static_mac = _lookup_mac_ladder(_STATIC_MAC_LADDER, effective_pairs)
     static_mac = min(tuned_static_mac or base_mac, base_mac)
-    if activation_precision == "fp4" and not use_micro and routed_rows < 40:
+    if activation_precision == "fp4" and not use_micro and effective_pairs < 40:
         static_mac = min(static_mac, 64)
 
     # Shared-scale flags let compact W4A4 micro match the ReLU2 single-token
-    # specialization.
+    # specialization. The shared-input slot is written by pair 0, which under
+    # EP may be non-local, so the specialization is disabled on shards.
     share_input_across_experts = (
         activation == "relu2"
         and num_tokens == 1
         and input_gs_is_shared
         and _MICRO_SHARE_INPUT_ACROSS_EXPERTS
+        and not is_ep
     )
     share_expert_scales = (
         activation == "relu2" and input_gs_is_shared and down_input_scale_is_shared
@@ -1068,10 +1166,12 @@ def launch_sm120_static_moe(
         # Single-token ReLU2 is non-gated, so the micro kernel can launch on
         # the routed expert ids directly. Gated SiLU still goes through the
         # compact id buffer so the kernel can map compact launch ids back to
-        # the physical gate/up weight experts.
-        if num_tokens == 1 and activation == "relu2":
+        # the physical gate/up weight experts. Both single-token shortcuts
+        # bypass non-local filtering, so EP shards always run the Triton
+        # compact pre-pass (which shifts ids and emits -1 for non-local).
+        if num_tokens == 1 and activation == "relu2" and not is_ep:
             launch_ids = flat_ids
-        elif num_tokens == 1:
+        elif num_tokens == 1 and not is_ep:
             compact_ids = workspace.compact_topk_ids[: flat_ids.numel()]
             compact_ids.copy_(
                 torch.arange(
@@ -1094,15 +1194,17 @@ def launch_sm120_static_moe(
                 compact_ids,
                 workspace.weight_expert_ids,
                 workspace.active_expert_count,
+                local_expert_offset=local_expert_offset,
+                num_local_experts=num_local_experts if is_ep else None,
             )
             launch_ids = compact_ids
         # Select micro MAC: min of tuned ladder, work tiles, and hardware limit.
-        micro_work_tiles = max(1, routed_rows * max(1, (n + 128 - 1) // 128))
-        tuned_mac = _lookup_mac_ladder(_MICRO_MAC_LADDER, routed_rows)
+        micro_work_tiles = max(1, effective_pairs * max(1, (n + 128 - 1) // 128))
+        tuned_mac = _lookup_mac_ladder(_MICRO_MAC_LADDER, effective_pairs)
         micro_mac = min(tuned_mac or base_mac, micro_work_tiles, base_mac)
         compiled, mac = _get_micro_kernel(
             workspace.state_E,
-            num_experts,
+            num_local_experts,
             num_tokens,
             k,
             n,
@@ -1113,7 +1215,7 @@ def launch_sm120_static_moe(
             fast_math=fast_math,
             share_input_across_experts=share_input_across_experts,
             share_expert_scales=share_expert_scales,
-            single_token=num_tokens == 1,
+            single_token=num_tokens == 1 and not is_ep,
             mac_override=micro_mac,
             activation=activation,
             swiglu_alpha=swiglu_alpha,
@@ -1121,9 +1223,20 @@ def launch_sm120_static_moe(
             swiglu_limit=swiglu_limit,
         )
     else:
+        # Per-expert row stripes are max_rows deep and the kernel's routing
+        # append never clamps, so capacity must cover full routing skew
+        # (every routed pair landing on one local expert). The functional
+        # path sizes workspaces from routed_rows; this guards pre-allocated
+        # (wrapper / CUDA-graph) workspaces against silent OOB corruption.
+        if routed_rows > workspace.max_rows:
+            raise ValueError(
+                f"static SM120 MoE workspace max_rows ({workspace.max_rows}) "
+                f"is smaller than the routed pair count ({routed_rows}); "
+                "allocate with max_rows >= num_tokens * top_k."
+            )
         compiled, mac = _get_static_kernel(
             workspace.state_E,
-            num_experts,
+            num_local_experts,
             num_tokens,
             k,
             n,
@@ -1138,6 +1251,7 @@ def launch_sm120_static_moe(
             swiglu_beta=swiglu_beta,
             swiglu_limit=swiglu_limit,
             activation_precision=activation_precision,
+            local_expert_offset=local_expert_offset,
         )
         launch_ids = flat_ids
 
@@ -1184,12 +1298,22 @@ def select_sm120_moe_backend(
     num_topk: int,
     activation_precision: str = "fp4",
     quant_mode: str | None = None,
+    num_local_experts: int | None = None,
+    num_experts: int | None = None,
 ) -> str:
-    """Pick static or dynamic backend based on routed-pair count."""
+    """Pick static or dynamic backend based on routed-pair count.
+
+    Pass ``num_local_experts``/``num_experts`` for an EP shard so the
+    cutover compares the expected LOCAL pair count (the kernels only ever
+    see local pairs; a shard at half width stays on the static kernel up to
+    twice the global pair count).
+    """
     mode = _normalize_quant_mode(quant_mode, activation_precision)
     if mode == "w4a16":
         return "w4a16"
     routed_rows = num_tokens * num_topk
+    if num_local_experts is not None and num_experts is not None:
+        routed_rows = _expected_local_pairs(routed_rows, num_local_experts, num_experts)
     if routed_rows <= _get_static_compact_cutover_pairs("fp4"):
         return "static"
     return "dynamic"
@@ -1541,6 +1665,7 @@ def _get_dynamic_kernel(
     swiglu_limit: float | None = None,
     activation_precision: str = "fp4",
     share_input_across_experts: bool = False,
+    local_expert_offset: int = 0,
 ):
     """Compile (or retrieve cached) the SM120 dynamic MoE kernel."""
     activation_precision = _normalize_activation_precision(activation_precision)
@@ -1576,6 +1701,7 @@ def _get_dynamic_kernel(
         swiglu_beta,
         swiglu_limit,
         share_input_across_experts,
+        local_expert_offset,
     )
     cached = _DYNAMIC_KERNEL_CACHE.get(cache_key)
     if cached is not None:
@@ -1600,6 +1726,7 @@ def _get_dynamic_kernel(
         swiglu_beta=swiglu_beta,
         swiglu_limit=swiglu_limit,
         share_input_across_experts=share_input_across_experts,
+        local_expert_offset=local_expert_offset,
     )
     launch = _DynamicMoELaunch(
         kernel,
@@ -1702,17 +1829,20 @@ def _get_dynamic_kernel(
     expert_tile_base_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Int32, (E + 1,), assumed_align=4
     )
+    # Per-expert fp32 scales are scalar-read in-kernel; align=4 so EP
+    # dim-0 slices (base + 4*local_expert_offset) are accepted (see the
+    # static-kernel fakes for the full rationale).
     input_gs_fake = cute.runtime.make_fake_compact_tensor(
-        alpha_dtype, (E,), assumed_align=16
+        alpha_dtype, (E,), assumed_align=4
     )
     alpha_fake = cute.runtime.make_fake_compact_tensor(
-        alpha_dtype, (E,), assumed_align=16
+        alpha_dtype, (E,), assumed_align=4
     )
     down_alpha_fake = cute.runtime.make_fake_compact_tensor(
-        alpha_dtype, (E,), assumed_align=16
+        alpha_dtype, (E,), assumed_align=4
     )
     global_scale_fake = cute.runtime.make_fake_compact_tensor(
-        alpha_dtype, (E,), assumed_align=16
+        alpha_dtype, (E,), assumed_align=4
     )
     scatter_fake = make_ptr(a_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
     token_map_fake = make_ptr(cutlass.Int32, 4, cute.AddressSpace.gmem, assumed_align=4)
@@ -1790,6 +1920,8 @@ def launch_sm120_dynamic_moe(
     k: int,
     n: int,
     top_k: int,
+    num_local_experts: int | None = None,
+    local_expert_offset: int = 0,
     input_scales_are_reciprocal: bool = False,
     fast_math: bool = True,
     activation: str = "silu",
@@ -1798,22 +1930,39 @@ def launch_sm120_dynamic_moe(
     swiglu_limit: float | None = None,
     activation_precision: str = "fp4",
 ) -> torch.Tensor:
-    """Launch the SM120 dynamic MoE kernel."""
+    """Launch the SM120 dynamic MoE kernel.
+
+    Under expert parallelism (num_local_experts < num_experts) the kernel
+    shifts routed ids by local_expert_offset and drops non-local pairs at
+    the histogram/pack stage; the shared-input producer variant has no
+    invalid-slot sentinel, so it is gated off for EP shards.
+    """
     activation_precision = _normalize_activation_precision(activation_precision)
     if activation_precision == "bf16":
         raise ValueError(
             "internal routing error: quant_mode='w4a16' reached the NVFP4 dynamic launcher"
         )
+    if num_local_experts is None:
+        num_local_experts = num_experts
+    is_ep = num_local_experts != num_experts or local_expert_offset != 0
+    if workspace.weight_E != num_local_experts:
+        raise ValueError(
+            "dynamic SM120 MoE workspace weight_E "
+            f"({workspace.weight_E}) does not match num_local_experts "
+            f"({num_local_experts}); allocate the workspace with "
+            "weight_E=num_local_experts."
+        )
     flat_ids = topk_ids.view(-1).to(torch.int32)
     flat_weights = topk_weights.view(-1).to(torch.float32)
     input_gs_is_shared = input_gs.numel() == 1
 
-    # Broadcast scalar scales to per-expert [E] tensors
-    input_gs = _expand_to_experts(input_gs, num_experts)
-    down_input_scale = _expand_to_experts(down_input_scale, num_experts)
+    # Broadcast scalar scales to per-expert tensors sized to the weight
+    # tensors' expert count (this rank's shard under EP).
+    input_gs = _expand_to_experts(input_gs, num_local_experts)
+    down_input_scale = _expand_to_experts(down_input_scale, num_local_experts)
 
     compiled, mac = _get_dynamic_kernel(
-        num_experts,
+        num_local_experts,
         num_tokens,
         k,
         n,
@@ -1827,7 +1976,8 @@ def launch_sm120_dynamic_moe(
         swiglu_beta=swiglu_beta,
         swiglu_limit=swiglu_limit,
         activation_precision=activation_precision,
-        share_input_across_experts=input_gs_is_shared,
+        share_input_across_experts=input_gs_is_shared and not is_ep,
+        local_expert_offset=local_expert_offset,
     )
 
     # Dynamic kernel: runtime-shaped args are DataPointer (pass data_ptr()),
@@ -1898,6 +2048,8 @@ class Sm120W4A16MoEWorkspace:
     quant_mode: str
     routed_rows_capacity: int
     route_num_experts: int
+    # EP shard start baked into expert_map; 0 when not expert-parallel.
+    local_expert_offset: int = 0
 
     intermediate_cache13: torch.Tensor
     intermediate_cache2: torch.Tensor
@@ -1980,14 +2132,30 @@ def _make_w4a16_expert_map(
     state_E: int,
     weight_E: int,
     device: torch.device,
+    local_expert_offset: int = 0,
 ) -> torch.Tensor | None:
-    if int(state_E) == int(weight_E):
-        return None
+    """Global-to-local expert map for the W4A16 route-pack filter.
+
+    Maps global expert id -> local weight row for this rank's contiguous
+    shard ``[local_expert_offset, local_expert_offset + state_E)``; all
+    other experts map to ``-1`` and their routed pairs are dropped by the
+    route-pack kernel. Returns ``None`` (no filtering) when the shard covers
+    the full expert space.
+    """
+    offset = int(local_expert_offset)
+    if offset < 0:
+        raise ValueError("local_expert_offset must be >= 0")
     if int(state_E) > int(weight_E):
         raise ValueError("num_local_experts cannot exceed num_experts")
+    if offset + int(state_E) > int(weight_E):
+        raise ValueError(
+            "local_expert_offset + num_local_experts cannot exceed num_experts"
+        )
+    if int(state_E) == int(weight_E):
+        return None
     expert_map = torch.empty((int(weight_E),), dtype=torch.int32, device=device)
     expert_map.fill_(-1)
-    expert_map[: int(state_E)].copy_(
+    expert_map[offset : offset + int(state_E)].copy_(
         torch.arange(int(state_E), dtype=torch.int32, device=device)
     )
     return expert_map
@@ -2003,6 +2171,7 @@ def _allocate_sm120_w4a16_workspace(
     num_topk: int,
     device: torch.device,
     activation: str = "silu",
+    local_expert_offset: int = 0,
 ) -> Sm120W4A16MoEWorkspace:
     is_gated = validate_activation(activation)
     routed_rows = max(1, int(routed_rows))
@@ -2034,6 +2203,7 @@ def _allocate_sm120_w4a16_workspace(
         quant_mode="w4a16",
         routed_rows_capacity=routed_rows,
         route_num_experts=route_num_experts,
+        local_expert_offset=int(local_expert_offset),
         intermediate_cache13=torch.empty(
             (routed_rows * max(fc1_cols, int(k)),),
             dtype=torch.bfloat16,
@@ -2074,6 +2244,7 @@ def _allocate_sm120_w4a16_workspace(
             state_E=state_E,
             weight_E=weight_E,
             device=device,
+            local_expert_offset=local_expert_offset,
         ),
     )
 
@@ -2154,10 +2325,17 @@ def _validate_w4a16_workspace(
     num_topk: int,
     device: torch.device,
     activation: str,
+    local_expert_offset: int = 0,
 ) -> None:
     validate_activation(activation)
     if workspace.state_E != int(state_E) or workspace.weight_E != int(weight_E):
         raise ValueError("pre-allocated W4A16 workspace expert geometry mismatch")
+    if int(getattr(workspace, "local_expert_offset", 0)) != int(local_expert_offset):
+        raise ValueError(
+            "pre-allocated W4A16 workspace local_expert_offset mismatch "
+            f"({getattr(workspace, 'local_expert_offset', 0)} != "
+            f"{local_expert_offset}); the expert map is baked at allocation."
+        )
     if workspace.k != int(k) or workspace.n != int(n):
         raise ValueError("pre-allocated W4A16 workspace hidden geometry mismatch")
     if workspace.num_topk != int(num_topk):
@@ -2190,6 +2368,7 @@ def _launch_sm120_w4a16_moe(
     top_k: int,
     num_local_experts: int,
     scatter_output: torch.Tensor,
+    local_expert_offset: int = 0,
     fast_math: bool = True,
     activation: str = "silu",
     source_format: str = "modelopt",
@@ -2230,6 +2409,7 @@ def _launch_sm120_w4a16_moe(
             device=a.device,
             quant_mode="w4a16",
             activation=activation,
+            local_expert_offset=local_expert_offset,
         )
     else:
         workspace = _workspace
@@ -2245,6 +2425,7 @@ def _launch_sm120_w4a16_moe(
         num_topk=top_k,
         device=a.device,
         activation=activation,
+        local_expert_offset=local_expert_offset,
     )
 
     return run_w4a16_moe(
@@ -2297,8 +2478,16 @@ def allocate_sm120_moe_workspace(
     activation_precision: str | None = None,
     backend: str | None = None,
     activation: str = "silu",
+    local_expert_offset: int = 0,
 ) -> _Sm120Workspace:
-    """Allocate the right SM120 MoE workspace from a quantization mode."""
+    """Allocate the right SM120 MoE workspace from a quantization mode.
+
+    ``local_expert_offset`` (EP shard start) is baked into the W4A16
+    workspace's expert map. Static and dynamic NVFP4 workspaces are
+    offset-agnostic — the offset lives in the compiled kernel, so the same
+    workspace serves any offset; under EP allocate both with
+    ``weight_E=num_local_experts`` (the launchers validate this).
+    """
     mode = _normalize_quant_mode(quant_mode, activation_precision)
     capacity_rows = routed_rows if routed_rows is not None else max_rows
     if capacity_rows is None:
@@ -2318,6 +2507,7 @@ def allocate_sm120_moe_workspace(
             num_topk=num_topk,
             device=device,
             activation=activation,
+            local_expert_offset=local_expert_offset,
         )
 
     activation_precision = "fp4"
@@ -2367,6 +2557,7 @@ def _get_cached_workspace(
     activation_precision: str = "fp4",
     quant_mode: str | None = None,
     activation: str = "silu",
+    local_expert_offset: int = 0,
 ) -> _Sm120Workspace:
     """Get or allocate a cached workspace for the given problem shape.
 
@@ -2375,6 +2566,10 @@ def _get_cached_workspace(
     For dynamic workspaces, routed_rows_capacity is used because the dynamic
     geometry (physical tiles, task queue slots) depends on the original
     routed_rows, not just max_rows.
+
+    local_expert_offset participates in the key because the W4A16 workspace
+    bakes it into its expert map (static workspaces are offset-agnostic but
+    a per-offset entry is harmless — offset is fixed per process).
     """
     quant_mode = _normalize_quant_mode(quant_mode, activation_precision)
     activation_precision = _activation_precision_from_quant_mode(quant_mode)
@@ -2388,6 +2583,7 @@ def _get_cached_workspace(
         backend,
         quant_mode,
         activation,
+        local_expert_offset,
     )
     cached = _WORKSPACE_CACHE.get(cache_key)
 
@@ -2418,6 +2614,7 @@ def _get_cached_workspace(
         activation_precision=activation_precision,
         backend=backend,
         activation=activation,
+        local_expert_offset=local_expert_offset,
     )
 
     _WORKSPACE_CACHE[cache_key] = workspace
@@ -2543,6 +2740,7 @@ def launch_sm120_moe(
     top_k: int,
     num_local_experts: int,
     scatter_output: torch.Tensor,
+    local_expert_offset: int = 0,
     input_scales_are_reciprocal: bool = False,
     fast_math: bool = True,
     activation: str = "silu",
@@ -2562,10 +2760,79 @@ def launch_sm120_moe(
     across calls to avoid per-call allocation overhead (wrapper path).
     When not provided (functional API path), a module-level workspace cache
     is used to avoid re-allocating on every call.
+
+    Expert parallelism: ``topk_ids`` always carries GLOBAL expert ids;
+    ``num_local_experts`` / ``local_expert_offset`` describe this rank's
+    contiguous shard, and all weight / per-expert scale tensors must be the
+    matching ``[num_local_experts, ...]`` slices. Non-local pairs are
+    dropped in-kernel; ``scatter_output`` is the partial sum over local
+    experts (zero rows for tokens with no local expert) and the caller
+    reduces across EP ranks. Top-k weights are used as given — normalize
+    globally, never per rank. EP runs natively on every backend: micro
+    (via the filtering Triton compact pre-pass), static, dynamic, and
+    w4a16. Backend-selection heuristics use the EXPECTED local pair count
+    (routed pairs scaled by num_local/num_experts). Single-token micro
+    shortcuts, the micro shared-input specialization, and the dynamic
+    shared-input producer variant are disabled on shards (they have no
+    non-local filtering).
+
+    NVFP4 (W4A4) scale contract — tensors must be in kernel convention:
+
+    - ``w1_weight_sf`` / ``w2_weight_sf`` must be FULL dequant block scales
+      (``weight ≈ fp4 * sf``) with any per-expert weight global scale
+      pre-baked in. ``source_format`` is provenance metadata only on this
+      branch; use ``prepare_b12x_nvfp4_packed_weights`` to translate raw
+      modelopt / compressed-tensors checkpoints.
+    - ``w1_alpha`` is aliased: it is both the FC1 activation-quant global
+      scale (``input_gs``; ``sf_a = fp8(max_abs / (6 * gs))``, see
+      ``quantize_block_fp4`` in ``flashinfer/cute_dsl/fp4_common.py`` — NOT
+      the opposite-convention twin in ``moe_w4a16_fp4_helpers.py``) and the
+      FC1 epilogue multiplier, so its value cancels exactly for any nonzero
+      alpha; it only tunes the fp8 range of the dynamic activation scales.
+    - ``w2_alpha`` must numerically equal ``fc2_input_scale`` when block
+      scales are fully baked (kernel invariant
+      ``down_alpha = fc2_gs * residual_w2_descale``).
+    - ``fc2_input_scale`` is required and must be scalar or per-expert
+      ``[E]`` (kernels index it per expert; per-channel values would be
+      silently misindexed).
     """
     quant_mode = _normalize_quant_mode(quant_mode, activation_precision)
     source_format = _normalize_source_format_for_quant_mode(source_format, quant_mode)
     activation_precision = _activation_precision_from_quant_mode(quant_mode)
+
+    if (
+        quant_mode == "nvfp4"
+        and source_format == "compressed_tensors"
+        and input_scales_are_reciprocal
+    ):
+        # The reciprocal flag inverts only the quant-side global scales inside
+        # the kernels, never the epilogue alphas, so combining it with
+        # compressed-tensors-tagged tensors would silently break the FC1
+        # alpha cancellation and the FC2 w2_alpha == fc2_input_scale invariant.
+        raise ValueError(
+            "input_scales_are_reciprocal=True is not supported with "
+            "quant_mode='nvfp4' and source_format='compressed_tensors'; "
+            "pre-translate scales with prepare_b12x_nvfp4_packed_weights "
+            "instead."
+        )
+
+    if num_local_experts < 1:
+        raise ValueError(f"num_local_experts must be >= 1, got {num_local_experts}")
+    if local_expert_offset < 0:
+        raise ValueError(f"local_expert_offset must be >= 0, got {local_expert_offset}")
+    if local_expert_offset + num_local_experts > num_experts:
+        raise ValueError(
+            "local_expert_offset + num_local_experts must not exceed num_experts "
+            f"({local_expert_offset} + {num_local_experts} > {num_experts})."
+        )
+    if quant_mode != "w4a16" and w1_weight.size(0) != num_local_experts:
+        # W4A16 validates against the prepared pack instead (its raw input
+        # layouts vary by checkpoint format).
+        raise ValueError(
+            "w1_weight must hold this rank's expert shard: expected "
+            f"w1_weight.shape[0] == num_local_experts ({num_local_experts}), "
+            f"got {w1_weight.size(0)}."
+        )
 
     num_tokens = topk_ids.size(0)
     k = a.size(1)  # hidden_size
@@ -2613,6 +2880,7 @@ def launch_sm120_moe(
             top_k=top_k,
             num_local_experts=num_local_experts,
             scatter_output=scatter_output,
+            local_expert_offset=local_expert_offset,
             fast_math=fast_math,
             activation=activation,
             source_format=source_format,
@@ -2655,12 +2923,6 @@ def launch_sm120_moe(
                 f"requested activation_precision={activation_precision!r}."
             )
         if isinstance(workspace, Sm120DynamicMoEWorkspace):
-            if num_local_experts != num_experts:
-                raise ValueError(
-                    "pre-allocated dynamic SM120 MoE workspace requires "
-                    "num_local_experts == num_experts because dynamic expert "
-                    "buffers are indexed by global topk ids."
-                )
             backend = "dynamic"
         else:
             backend = "static"
@@ -2669,17 +2931,16 @@ def launch_sm120_moe(
             num_tokens=num_tokens,
             num_topk=top_k,
             activation_precision=activation_precision,
+            num_local_experts=num_local_experts,
+            num_experts=num_experts,
         )
-        # The dynamic kernel indexes row_counts/expert_write_rows directly with
-        # topk_ids but those buffers are sized with num_local_experts. Unless
-        # num_local_experts == num_experts, fall back to the static backend which
-        # has global-to-local expert remapping.
-        if backend == "dynamic" and num_local_experts != num_experts:
-            backend = "static"
+        # weight_E is the weight tensors' expert count: num_local_experts
+        # (== num_experts when not expert-parallel). The static kernel's
+        # per-expert tensor bindings are compiled against this width.
         workspace = _get_cached_workspace(
             backend=backend,
             state_E=num_local_experts,
-            weight_E=num_experts,
+            weight_E=num_local_experts,
             routed_rows=routed_rows,
             k=k,
             n=n,
@@ -2688,6 +2949,7 @@ def launch_sm120_moe(
             activation_precision=activation_precision,
             quant_mode=quant_mode,
             activation=activation,
+            local_expert_offset=local_expert_offset,
         )
 
     if backend == "dynamic":
@@ -2705,6 +2967,8 @@ def launch_sm120_moe(
             k=k,
             n=n,
             top_k=top_k,
+            num_local_experts=num_local_experts,
+            local_expert_offset=local_expert_offset,
             input_scales_are_reciprocal=input_scales_are_reciprocal,
             fast_math=fast_math,
             activation=activation,
@@ -2728,6 +2992,8 @@ def launch_sm120_moe(
             k=k,
             n=n,
             top_k=top_k,
+            num_local_experts=num_local_experts,
+            local_expert_offset=local_expert_offset,
             input_scales_are_reciprocal=input_scales_are_reciprocal,
             fast_math=fast_math,
             activation=activation,

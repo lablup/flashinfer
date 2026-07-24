@@ -3257,6 +3257,17 @@ b12x_fused_moe_trace = TraceTemplate(
         ),
         "num_experts": Scalar("int32", description="Total experts."),
         "top_k": Scalar("int32"),
+        "local_expert_offset": Scalar(
+            "int32",
+            optional=True,
+            description=(
+                "Start of this rank's contiguous expert shard under expert "
+                "parallelism. Routing ids stay global; weight/scale tensors "
+                "are the [num_local_experts, ...] slices; the output is the "
+                "partial sum over local experts (caller reduces across EP "
+                "ranks). Default 0."
+            ),
+        ),
         "w1_alpha": Tensor(
             ["num_local_experts"],
             dtype="float32",
@@ -3294,8 +3305,9 @@ b12x_fused_moe_trace = TraceTemplate(
             "string",
             optional=True,
             description=(
-                "Source weight format for quant_mode='w4a16': 'modelopt' or "
-                "'compressed_tensors'."
+                "Checkpoint source format: 'modelopt' or 'compressed_tensors'. "
+                "Selects the scale translation for quant_mode='w4a16'; "
+                "pass-through provenance metadata for quant_mode='nvfp4'."
             ),
         ),
     },
@@ -3323,7 +3335,9 @@ _b12x_wrapper_inputs["source_format"] = Scalar(
     "string",
     optional=True,
     description=(
-        "Source weight format set at wrapper __init__ for quant_mode='w4a16'."
+        "Checkpoint source format set at wrapper __init__: 'modelopt' or "
+        "'compressed_tensors' (scale translation for 'w4a16'; provenance "
+        "metadata for 'nvfp4')."
     ),
 )
 _b12x_wrapper_inputs["num_experts"] = Scalar(
@@ -3335,6 +3349,11 @@ _b12x_wrapper_inputs["top_k"] = Scalar(
     "int32",
     optional=True,
     description="Set at wrapper __init__, not passed to run().",
+)
+_b12x_wrapper_inputs["local_expert_offset"] = Scalar(
+    "int32",
+    optional=True,
+    description="EP shard start, set at wrapper __init__, not passed to run().",
 )
 
 _b12x_wrapper_axes = dict(b12x_fused_moe_trace.axes)
@@ -3450,10 +3469,11 @@ def _b12x_source_format(source_format="modelopt", quant_mode="nvfp4"):
             "source_format must be one of 'modelopt' or 'compressed_tensors', "
             f"got {source_format!r}"
         ) from exc
-    if quant_mode == "nvfp4" and normalized == "compressed_tensors":
-        raise ValueError(
-            "source_format='compressed_tensors' requires quant_mode='w4a16'."
-        )
+    # For quant_mode='nvfp4' the value is pass-through provenance metadata
+    # (tensors must already be in kernel convention); for 'w4a16' it selects
+    # the prepare-time scale translation. Mirrors moe_dispatch's
+    # _normalize_source_format_for_quant_mode.
+    del quant_mode
     return normalized
 
 
@@ -3534,6 +3554,7 @@ def _b12x_fused_moe_reference(
     w1_alpha=None,
     w2_alpha=None,
     fc2_input_scale=None,
+    local_expert_offset=0,
     activation_precision="fp4",
     quant_mode=None,
     source_format="modelopt",
@@ -3553,7 +3574,7 @@ def _b12x_fused_moe_reference(
         W2,
         token_final_scales,
         token_selected_experts.to(torch.int64),
-        local_expert_offset=0,
+        local_expert_offset=int(local_expert_offset),
         E_global=int(num_experts),
         activation_precision=activation_precision,
         fc2_input_scale=fc2_input_scale,

@@ -53,6 +53,22 @@ def _is_cuda_graph_capturing() -> bool:
         return False
 
 
+def _validate_expert_shard(
+    *, num_experts: int, num_local_experts: int, local_expert_offset: int
+) -> None:
+    """Validate an expert-parallel shard: a contiguous slice of experts."""
+    if num_local_experts < 1:
+        raise ValueError(f"num_local_experts must be >= 1, got {num_local_experts}")
+    if local_expert_offset < 0:
+        raise ValueError(f"local_expert_offset must be >= 0, got {local_expert_offset}")
+    if local_expert_offset + num_local_experts > num_experts:
+        raise ValueError(
+            "local_expert_offset + num_local_experts must not exceed "
+            f"num_experts ({local_expert_offset} + {num_local_experts} > "
+            f"{num_experts})."
+        )
+
+
 @supported_compute_capability([120, 121])
 @flashinfer_api(trace=b12x_fused_moe_trace)
 def b12x_fused_moe(
@@ -70,6 +86,7 @@ def b12x_fused_moe(
     w2_alpha: torch.Tensor,
     fc2_input_scale: Optional[torch.Tensor] = None,
     num_local_experts: Optional[int] = None,
+    local_expert_offset: int = 0,
     output: Optional[torch.Tensor] = None,
     output_dtype: torch.dtype = torch.bfloat16,
     activation: str = "silu",
@@ -118,7 +135,21 @@ def b12x_fused_moe(
         ``quant_mode="nvfp4"``; accepted but ignored for
         ``quant_mode="w4a16"``.
     num_local_experts : Optional[int]
-        Local experts for expert parallelism.  Defaults to ``num_experts``.
+        Number of experts owned by this rank under expert parallelism.
+        Defaults to ``num_experts`` (no EP).
+    local_expert_offset : int
+        Start of this rank's contiguous expert shard in the global expert
+        space.  ``token_selected_experts`` always carries GLOBAL expert ids;
+        the kernel drops ids outside
+        ``[local_expert_offset, local_expert_offset + num_local_experts)``.
+        All weight and per-expert scale tensors (``w1_weight``,
+        ``w1_weight_sf``, ``w1_alpha``, ``fc2_input_scale`` when per-expert,
+        ``w2_*``) must be this rank's ``[num_local_experts, ...]`` slices.
+        The returned tensor is the PARTIAL sum over local experts — zero
+        rows for tokens with no local expert — and the caller must sum
+        (all-reduce) partial outputs across EP ranks.
+        ``token_final_scales`` must be normalized over the global top-k;
+        do not renormalize per rank.  Defaults to ``0``.
     output : Optional[torch.Tensor]
         Pre-allocated output buffer of shape ``[num_tokens, hidden_size]``,
         ``bfloat16``.
@@ -140,8 +171,14 @@ def b12x_fused_moe(
         Quantization mode, ``"nvfp4"`` / ``"w4a4"`` or ``"w4a16"``.  When set,
         selects the backend and internal workspace family.
     source_format : str
-        Source weight format for ``quant_mode="w4a16"`` — ``"modelopt"`` or
-        ``"compressed_tensors"``.  Defaults to ``"modelopt"``.
+        Checkpoint source format — ``"modelopt"`` or ``"compressed_tensors"``.
+        Defaults to ``"modelopt"``.  For ``quant_mode="w4a16"`` this selects
+        the scale translation applied at weight-preparation time.  For
+        ``quant_mode="nvfp4"`` it is accepted as pass-through provenance
+        metadata: tensors must already be in kernel convention (full dequant
+        block scales; ``w2_alpha == fc2_input_scale``) — use
+        :func:`flashinfer.fused_moe.prepare.prepare_b12x_nvfp4_packed_weights`
+        to translate raw checkpoint tensors.
 
     Returns
     -------
@@ -173,12 +210,21 @@ def b12x_fused_moe(
     if num_local_experts is None:
         num_local_experts = num_experts
 
-    if num_local_experts != num_experts:
-        raise NotImplementedError(
-            f"b12x_fused_moe does not yet support Expert Parallelism "
-            f"(num_local_experts={num_local_experts} != num_experts={num_experts}). "
-            f"Use a different MoE backend for EP configurations."
-        )
+    _validate_expert_shard(
+        num_experts=num_experts,
+        num_local_experts=num_local_experts,
+        local_expert_offset=local_expert_offset,
+    )
+
+    from .blackwell_sm12x.moe_dispatch import (
+        _normalize_quant_mode,
+        _normalize_source_format_for_quant_mode,
+    )
+
+    # Validate/normalize eagerly so bad values fail before buffer allocation.
+    source_format = _normalize_source_format_for_quant_mode(
+        source_format, _normalize_quant_mode(quant_mode, activation_precision)
+    )
 
     num_tokens = token_selected_experts.size(0)
     hidden_size = x.size(1)
@@ -211,6 +257,7 @@ def b12x_fused_moe(
         num_experts=num_experts,
         top_k=top_k,
         num_local_experts=num_local_experts,
+        local_expert_offset=local_expert_offset,
         scatter_output=output,
         activation=activation,
         swiglu_alpha=swiglu_alpha,
@@ -245,8 +292,11 @@ class B12xMoEWrapper:
             "fp4" selects quant_mode="nvfp4"; "bf16" selects quant_mode="w4a16".
         quant_mode: Quantization mode, "nvfp4"/"w4a4" or "w4a16". When set,
             this selects the backend and internal workspace family.
-        source_format: Source weight format for quant_mode="w4a16".
-            Supports "modelopt" and "compressed_tensors". Default: "modelopt".
+        source_format: Checkpoint source format, "modelopt" or
+            "compressed_tensors". Default: "modelopt". Selects the w4a16
+            scale translation; pass-through provenance metadata for nvfp4
+            (tensors must already be in kernel convention — see
+            prepare_b12x_nvfp4_packed_weights).
 
     Example:
         >>> moe = B12xMoEWrapper(num_experts=256, top_k=8, ...)
@@ -265,6 +315,7 @@ class B12xMoEWrapper:
         use_cuda_graph: bool = False,
         max_num_tokens: int = 4096,
         num_local_experts: Optional[int] = None,
+        local_expert_offset: int = 0,
         output_dtype: torch.dtype = torch.bfloat16,
         device: str = "cuda",
         activation: str = "silu",
@@ -295,8 +346,16 @@ class B12xMoEWrapper:
             Maximum batch size, only used when ``use_cuda_graph=True``.
             Defaults to ``4096``.
         num_local_experts : Optional[int]
-            Number of local experts for expert parallelism.  Defaults to
-            ``num_experts``.
+            Number of experts owned by this rank under expert parallelism.
+            Defaults to ``num_experts`` (no EP).
+        local_expert_offset : int
+            Start of this rank's contiguous expert shard in the global
+            expert space (see :func:`b12x_fused_moe` for the full EP
+            contract: global routing ids, local weight/scale slices,
+            partial-sum output reduced by the caller).  Defaults to ``0``.
+            EP runs natively on all backends (micro / static / dynamic /
+            w4a16); backend selection scales its cutovers by the shard
+            fraction so shards keep low-latency kernels longer.
         output_dtype : torch.dtype
             Output dtype.  Only ``torch.bfloat16`` is currently supported.
         device : str
@@ -316,13 +375,17 @@ class B12xMoEWrapper:
         quant_mode : Optional[str]
             Quantization mode, ``"nvfp4"`` / ``"w4a4"`` or ``"w4a16"``.
         source_format : str
-            Source weight format for ``quant_mode="w4a16"`` —
-            ``"modelopt"`` (default) or ``"compressed_tensors"``.
+            Checkpoint source format — ``"modelopt"`` (default) or
+            ``"compressed_tensors"``.  Selects the w4a16 scale translation;
+            pass-through provenance metadata for ``quant_mode="nvfp4"``
+            (tensors must already be in kernel convention — see
+            ``prepare_b12x_nvfp4_packed_weights``).
         """
         from ...jit.cpp_ext import get_cuda_version
         from .blackwell_sm12x.moe_dispatch import (
             _activation_precision_from_quant_mode,
             _normalize_quant_mode,
+            _normalize_source_format_for_quant_mode,
         )
 
         if get_cuda_version().major < 13:
@@ -344,15 +407,20 @@ class B12xMoEWrapper:
         self.intermediate_size = intermediate_size
         self.use_cuda_graph = use_cuda_graph
         self.max_num_tokens = max_num_tokens
-        self.num_local_experts = num_local_experts or num_experts
+        # Only None means "unset" — 0 must reach validation and fail loudly,
+        # matching b12x_fused_moe (an `or` would silently coerce 0 to
+        # num_experts and full-width weights would double-count after the
+        # caller's EP all-reduce).
+        self.num_local_experts = (
+            num_local_experts if num_local_experts is not None else num_experts
+        )
+        self.local_expert_offset = local_expert_offset
 
-        if self.num_local_experts != self.num_experts:
-            raise NotImplementedError(
-                f"B12xMoEWrapper does not yet support Expert Parallelism "
-                f"(num_local_experts={self.num_local_experts} != "
-                f"num_experts={self.num_experts}). "
-                f"Use a different MoE backend for EP configurations."
-            )
+        _validate_expert_shard(
+            num_experts=self.num_experts,
+            num_local_experts=self.num_local_experts,
+            local_expert_offset=self.local_expert_offset,
+        )
         self.output_dtype = output_dtype
         self.device = device
         self.activation = activation
@@ -363,7 +431,11 @@ class B12xMoEWrapper:
         self.activation_precision = _activation_precision_from_quant_mode(
             self.quant_mode
         )
-        self.source_format = source_format
+        # Validate/normalize eagerly so invalid values fail at construction
+        # rather than on the first run() call.
+        self.source_format = _normalize_source_format_for_quant_mode(
+            source_format, self.quant_mode
+        )
 
         # Pre-allocated objects. Both workspace slots may be populated so
         # run() can pick per-call; without this, the backend would be locked
@@ -382,14 +454,23 @@ class B12xMoEWrapper:
     def _allocate_buffers(self) -> None:
         """Pre-allocate buffers for CUDA graph compatibility."""
         from .blackwell_sm12x.moe_dispatch import (
-            allocate_sm120_moe_workspace,
+            _get_cached_workspace,
             select_sm120_moe_backend,
             _get_static_compact_cutover_pairs,
         )
 
+        # Workspaces come from the module-level pool so wrappers with the
+        # same geometry SHARE scratch buffers. Serving stacks build one
+        # wrapper per MoE layer (e.g. 48 for Solar-Open2); private buffers
+        # would multiply ~0.5 GB of scratch by the layer count. Sharing is
+        # stream-order-safe: every kernel fully rewrites its scratch in
+        # Phase 0 and layers execute sequentially (callers copy the output
+        # before the next layer runs), including inside one CUDA graph.
+
         max_routed_rows = self.max_num_tokens * self.top_k
         if self.quant_mode == "w4a16":
-            self._static_workspace = allocate_sm120_moe_workspace(
+            self._static_workspace = _get_cached_workspace(
+                backend="w4a16",
                 state_E=self.num_local_experts,
                 weight_E=self.num_experts,
                 routed_rows=max_routed_rows,
@@ -399,6 +480,7 @@ class B12xMoEWrapper:
                 device=torch.device(self.device),
                 quant_mode=self.quant_mode,
                 activation=self.activation,
+                local_expert_offset=self.local_expert_offset,
             )
             self._moe_output = torch.empty(
                 (self.max_num_tokens, self.hidden_size),
@@ -409,55 +491,63 @@ class B12xMoEWrapper:
 
         # Allocate a dynamic workspace alongside the static one when
         # max_num_tokens is large enough to cross the cutover. This lets
-        # run() adapt backend per call rather than locking at init. The
-        # dynamic kernel indexes row_counts/expert_write_rows with topk_ids
-        # (sized by num_local_experts), so it requires num_local == num_experts.
+        # run() adapt backend per call rather than locking at init.
         needs_dynamic = (
             select_sm120_moe_backend(
                 num_tokens=self.max_num_tokens,
                 num_topk=self.top_k,
                 activation_precision=self.activation_precision,
+                num_local_experts=self.num_local_experts,
+                num_experts=self.num_experts,
             )
             == "dynamic"
-            and self.num_local_experts == self.num_experts
         )
 
-        # When both workspaces exist, static only serves calls with
-        # routed_rows <= cutover; size it accordingly to avoid paying for
-        # the full capacity twice.
+        # When both workspaces exist, static only serves calls whose
+        # EXPECTED-local pair count is <= cutover; size it accordingly to
+        # avoid paying for the full capacity twice. Under EP the floor-based
+        # selection admits up to ((cutover+1) * num_experts - 1) //
+        # num_local GLOBAL pairs, and skewed routing could land every one of
+        # them on this shard — capacity must cover that exact admission
+        # bound, not the expectation (launch_sm120_static_moe re-validates).
+        static_cutover = _get_static_compact_cutover_pairs(self.activation_precision)
+        if self.num_local_experts < self.num_experts:
+            static_cutover = (
+                (static_cutover + 1) * self.num_experts - 1
+            ) // self.num_local_experts
         static_max_rows = (
-            min(
-                max_routed_rows,
-                _get_static_compact_cutover_pairs(self.activation_precision),
-            )
-            if needs_dynamic
-            else max_routed_rows
+            min(max_routed_rows, static_cutover) if needs_dynamic else max_routed_rows
         )
-        self._static_workspace = allocate_sm120_moe_workspace(
+        # weight_E is the weight tensors' expert count — this rank's shard
+        # width under EP (the static kernel binds per-expert tensors at that
+        # width; the shard offset lives in the compiled kernel, not here).
+        self._static_workspace = _get_cached_workspace(
+            backend="static",
             state_E=self.num_local_experts,
-            weight_E=self.num_experts,
-            max_rows=max(1, static_max_rows),
+            weight_E=self.num_local_experts,
+            routed_rows=max(1, static_max_rows),
             k=self.hidden_size,
             n=self.intermediate_size,
             num_topk=self.top_k,
             device=torch.device(self.device),
             quant_mode=self.quant_mode,
-            backend="static",
             activation=self.activation,
+            local_expert_offset=self.local_expert_offset,
         )
 
         if needs_dynamic:
-            self._dynamic_workspace = allocate_sm120_moe_workspace(
+            self._dynamic_workspace = _get_cached_workspace(
+                backend="dynamic",
                 state_E=self.num_local_experts,
-                weight_E=self.num_experts,
+                weight_E=self.num_local_experts,
                 routed_rows=max_routed_rows,
                 k=self.hidden_size,
                 n=self.intermediate_size,
                 num_topk=self.top_k,
                 device=torch.device(self.device),
                 quant_mode=self.quant_mode,
-                backend="dynamic",
                 activation=self.activation,
+                local_expert_offset=self.local_expert_offset,
             )
 
         # Allocated after arch-specific buffers to preserve memory layout
@@ -559,6 +649,8 @@ class B12xMoEWrapper:
                     num_tokens=num_tokens,
                     num_topk=self.top_k,
                     activation_precision=self.activation_precision,
+                    num_local_experts=self.num_local_experts,
+                    num_experts=self.num_experts,
                 )
                 == "dynamic"
             ):
@@ -642,6 +734,7 @@ class B12xMoEWrapper:
             num_experts=self.num_experts,
             top_k=self.top_k,
             num_local_experts=self.num_local_experts,
+            local_expert_offset=self.local_expert_offset,
             scatter_output=moe_output,
             activation=self.activation,
             swiglu_alpha=self.swiglu_alpha,

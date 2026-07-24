@@ -50,6 +50,7 @@ output_column_dict = {
         "routed_scaling_factor",
         "local_expert_offset",
         "local_num_experts",
+        "ep_compute_fraction",
         "routing_method",
         "use_shuffled_weight",
         "weight_layout",

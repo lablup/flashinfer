@@ -652,6 +652,82 @@ def create_moe_tensors(
     }
 
 
+def slice_b12x_moe_tensors_for_ep(
+    tensors: dict,
+    local_expert_offset: int,
+    num_local_experts: int,
+) -> dict:
+    """Build one EP rank's b12x tensor shard from full-model tensors.
+
+    Re-quantizes the canonical bf16 slice with the same settings as
+    :func:`create_b12x_moe_tensors` (global scale 1.0, swizzled sf converted
+    to the MMA layout). Quantization is per-row with a fixed global scale, so
+    this is bitwise-identical to slicing the full-model quantization — the
+    shard computes exactly the same expert math as the full run.
+
+    Routing tensors (global expert ids, globally normalized weights) and the
+    input are shared across ranks and returned unchanged.
+    """
+    from flashinfer.fp4_quantization import fp4_quantize
+    from flashinfer.cute_dsl.utils import convert_sf_to_mma_layout
+
+    sf_vec_size = 16
+    s = int(local_expert_offset)
+    e = s + int(num_local_experts)
+    w1_bf16 = tensors["w1_weight_bf16"][s:e].contiguous()
+    w2_bf16 = tensors["w2_weight_bf16"][s:e].contiguous()
+    E_local, fc1_rows, hidden_size = w1_bf16.shape
+    intermediate_size = w2_bf16.shape[2]
+    gs = torch.tensor([1.0], device=w1_bf16.device, dtype=torch.float32)
+
+    w1_q_flat, w1_sf_flat = fp4_quantize(
+        w1_bf16.reshape(E_local * fc1_rows, hidden_size),
+        global_scale=gs,
+        sf_vec_size=sf_vec_size,
+        is_sf_swizzled_layout=True,
+    )
+    w1_weight_sf = convert_sf_to_mma_layout(
+        w1_sf_flat,
+        m=fc1_rows,
+        k=hidden_size,
+        num_groups=E_local,
+        sf_vec_size=sf_vec_size,
+    )
+    w2_q_flat, w2_sf_flat = fp4_quantize(
+        w2_bf16.reshape(E_local * hidden_size, intermediate_size),
+        global_scale=gs,
+        sf_vec_size=sf_vec_size,
+        is_sf_swizzled_layout=True,
+    )
+    w2_weight_sf = convert_sf_to_mma_layout(
+        w2_sf_flat,
+        m=hidden_size,
+        k=intermediate_size,
+        num_groups=E_local,
+        sf_vec_size=sf_vec_size,
+    )
+
+    fc2_input_scale = tensors["fc2_input_scale"]
+    if fc2_input_scale is not None and fc2_input_scale.numel() > 1:
+        fc2_input_scale = fc2_input_scale[s:e].contiguous()
+
+    shard = dict(tensors)
+    shard.update(
+        {
+            "w1_weight": w1_q_flat.view(E_local, fc1_rows, hidden_size // 2),
+            "w1_weight_sf": w1_weight_sf,
+            "w1_weight_bf16": w1_bf16,
+            "w1_alpha": tensors["w1_alpha"][s:e].contiguous(),
+            "fc2_input_scale": fc2_input_scale,
+            "w2_weight": w2_q_flat.view(E_local, hidden_size, intermediate_size // 2),
+            "w2_weight_sf": w2_weight_sf,
+            "w2_weight_bf16": w2_bf16,
+            "w2_alpha": tensors["w2_alpha"][s:e].contiguous(),
+        }
+    )
+    return shard
+
+
 def create_b12x_moe_tensors(
     num_tokens: int,
     hidden_size: int,
@@ -675,6 +751,179 @@ def create_b12x_moe_tensors(
         interleave_gated_weights=False,
         use_nontrivial_alphas=False,
     )
+
+
+def create_b12x_ct_moe_tensors(
+    num_tokens: int,
+    hidden_size: int,
+    intermediate_size: int,
+    num_experts: int,
+    num_local_experts: int,
+    top_k: int,
+    device: str = "cuda",
+    seed: int = 42,
+):
+    """Create B12x MoE tensors in checkpoint conventions with non-unit scales.
+
+    Quantizes each expert with a per-expert compressed-tensors global scale
+    (``gs = 448 * 6 / amax``, the "BIG" convention) and returns three
+    equivalent representations of the same logical weights:
+
+    - ``ct``: packed FP4 + LINEAR (row-major) fp8 block scales + BIG
+      per-expert global scales — what a compressed-tensors
+      ``nvfp4-pack-quantized`` checkpoint stores.
+    - ``modelopt``: same packed FP4 + linear scales, with global scales
+      stored as direct multipliers (``weight_scale_2 = 1 / gs``).
+    - ``native``: the kernel-convention pack built independently through the
+      already-tested layout path (bake ``1/gs`` into the swizzled scales,
+      then ``convert_sf_to_mma_layout``), with unit alphas — the expected
+      bitwise output of ``prepare_b12x_nvfp4_packed_weights``.
+
+    Also returns bf16 logical weights, input, and routing tensors shared by
+    all three.
+    """
+    from flashinfer.fp4_quantization import fp4_quantize
+    from flashinfer.cute_dsl.utils import convert_sf_to_mma_layout
+    from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_w4a16_host import (
+        unswizzle_block_scale,
+    )
+
+    torch.manual_seed(seed)
+    sf_vec_size = 16
+
+    x_bf16 = (
+        torch.randn(num_tokens, hidden_size, dtype=torch.bfloat16, device=device) / 10
+    )
+
+    router_logits = torch.randn(num_tokens, num_experts, device=device)
+    routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
+    routing_weights, selected_experts = torch.topk(routing_weights, top_k, dim=-1)
+    routing_weights = (
+        routing_weights / routing_weights.sum(dim=-1, keepdim=True)
+    ).float()
+    selected_experts = selected_experts.to(torch.int32)
+
+    # Non-interleaved [up, gate] b12x layout; per-expert magnitude variation so
+    # the per-expert global scales are genuinely non-uniform.
+    expert_gain = torch.linspace(0.5, 2.0, num_local_experts, device=device)
+    w1_bf16 = (
+        torch.randn(
+            num_local_experts,
+            2 * intermediate_size,
+            hidden_size,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        / 10
+        * expert_gain.view(-1, 1, 1)
+    ).to(torch.bfloat16)
+    w2_bf16 = (
+        torch.randn(
+            num_local_experts,
+            hidden_size,
+            intermediate_size,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        / 10
+        * expert_gain.view(-1, 1, 1)
+    ).to(torch.bfloat16)
+
+    def _quantize_ct(weights: torch.Tensor):
+        """Per-expert quantize with BIG ct global scales.
+
+        Returns (packed fp4, linear fp8 scales, swizzled fp8 scale storage,
+        BIG global scales).
+        """
+        E, rows, cols = weights.shape
+        cols_blocks = cols // sf_vec_size
+        amax = weights.abs().amax(dim=(1, 2)).float().clamp(min=1e-6)
+        gs_ct = (448.0 * 6.0) / amax
+        codes, sf_linear, sf_swizzled = [], [], []
+        for e in range(E):
+            code_e, sf_e = fp4_quantize(
+                weights[e],
+                global_scale=gs_ct[e : e + 1],
+                sf_vec_size=sf_vec_size,
+                is_sf_swizzled_layout=True,
+            )
+            codes.append(code_e)
+            sf_swizzled.append(sf_e.reshape(-1))
+            sf_linear.append(
+                unswizzle_block_scale(sf_e, rows=rows, cols_blocks=cols_blocks).to(
+                    torch.float8_e4m3fn
+                )
+            )
+        return (
+            torch.stack(codes, 0),
+            torch.stack(sf_linear, 0),
+            torch.stack(sf_swizzled, 0),
+            gs_ct.contiguous(),
+        )
+
+    w1_fp4, w1_sf_linear, w1_sf_swizzled, w1_gs_ct = _quantize_ct(w1_bf16)
+    w2_fp4, w2_sf_linear, w2_sf_swizzled, w2_gs_ct = _quantize_ct(w2_bf16)
+
+    def _native_mma_sf(
+        sf_swizzled: torch.Tensor, gs_ct: torch.Tensor, rows: int, cols: int
+    ):
+        """Bake 1/gs into swizzled scales, then convert to the 6D MMA layout."""
+        E = sf_swizzled.size(0)
+        baked = (
+            (sf_swizzled.view(torch.float8_e4m3fn).float() * (1.0 / gs_ct).view(-1, 1))
+            .clamp_(max=448.0)
+            .to(torch.float8_e4m3fn)
+        )
+        cols_padded = ((cols // sf_vec_size + 3) // 4) * 4
+        return convert_sf_to_mma_layout(
+            baked.reshape(-1, cols_padded),
+            m=rows,
+            k=cols,
+            num_groups=E,
+            sf_vec_size=sf_vec_size,
+        )
+
+    ones = torch.ones(num_local_experts, device=device, dtype=torch.float32)
+    native = {
+        "w1_weight": w1_fp4,
+        "w1_weight_sf": _native_mma_sf(
+            w1_sf_swizzled, w1_gs_ct, 2 * intermediate_size, hidden_size
+        ),
+        "w1_alpha": ones.clone(),
+        "fc2_input_scale": ones.clone(),
+        "w2_weight": w2_fp4,
+        "w2_weight_sf": _native_mma_sf(
+            w2_sf_swizzled, w2_gs_ct, hidden_size, intermediate_size
+        ),
+        "w2_alpha": ones.clone(),
+    }
+
+    return {
+        "x_bf16": x_bf16,
+        "token_selected_experts": selected_experts,
+        "token_final_scales": routing_weights,
+        "w1_weight_bf16": w1_bf16,
+        "w2_weight_bf16": w2_bf16,
+        # compressed-tensors checkpoint convention (BIG global scales).
+        "ct": {
+            "w1_fp4": w1_fp4,
+            "w1_blockscale": w1_sf_linear,
+            "w1_global_scale": w1_gs_ct,
+            "w2_fp4": w2_fp4,
+            "w2_blockscale": w2_sf_linear,
+            "w2_global_scale": w2_gs_ct,
+        },
+        # ModelOpt convention twin (global scales are direct multipliers).
+        "modelopt": {
+            "w1_fp4": w1_fp4,
+            "w1_blockscale": w1_sf_linear,
+            "w1_global_scale": (1.0 / w1_gs_ct).contiguous(),
+            "w2_fp4": w2_fp4,
+            "w2_blockscale": w2_sf_linear,
+            "w2_global_scale": (1.0 / w2_gs_ct).contiguous(),
+        },
+        "native": native,
+    }
 
 
 def create_relu2_moe_tensors(

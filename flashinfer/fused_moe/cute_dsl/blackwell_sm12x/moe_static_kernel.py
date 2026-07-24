@@ -71,6 +71,16 @@ Scale-contract note
   routed pair with input_global_scale[expert]. That is checkpoint-correct for
   models where gate/up input scales vary across experts.
 
+Expert parallelism
+  local_expert_offset (compile-time) shifts routed global expert ids into the
+  weight-tensor index space; pairs whose shifted id falls outside
+  [0, num_weight_experts) belong to other EP ranks and are dropped in the
+  route/pack phase. All per-expert tensors (weights, block scales, alphas,
+  input_global_scale) are indexed by the shifted id, so under EP the caller
+  passes this rank's [num_local_experts, ...] slices. The output is the
+  partial sum over local experts (Phase 0 zeroes scatter_output, so tokens
+  with no local expert yield zero rows); the caller reduces across EP ranks.
+
 Design boundary
   The static kernel is the compact decode backend. It keeps route/pack and
   compute in one resident launch for small routed working sets, and relies on
@@ -350,13 +360,24 @@ class MoEStaticKernel:
         swiglu_alpha: float = 1.702,
         swiglu_beta: float = 1.0,
         swiglu_limit: float | None = None,
+        local_expert_offset: int = 0,
     ):
         if activation not in {"silu", "relu2", "gelu_tanh", "swigluoai_uninterleave"}:
             raise ValueError(f"unsupported activation {activation!r}")
+        if local_expert_offset < 0:
+            raise ValueError(
+                f"local_expert_offset must be >= 0, got {local_expert_offset}"
+            )
         self._dense_cls = DenseGemmKernel
         self.acc_dtype = cutlass.Float32
         self.sf_vec_size = sf_vec_size
         self.input_scales_are_reciprocal = input_scales_are_reciprocal
+        # Expert-parallel shard start in the global expert space. Baked at
+        # compile time (each EP rank is its own process with a fixed offset).
+        # The pack phase shifts routed ids by this and drops ids outside
+        # [0, num_weight_experts) — with offset 0 and full-width weight
+        # tensors the filter is a no-op, so non-EP behavior is unchanged.
+        self.local_expert_offset = int(local_expert_offset)
         self.fast_math = fast_math
         self.activation = activation
         self.is_gated = is_gated_activation(activation)
@@ -614,8 +635,8 @@ class MoEStaticKernel:
         sfb_down_ptr: cute.Pointer,
         row_counts: cute.Tensor,  # [state_E] routed rows per local expert
         active_expert_count: cute.Tensor,  # [1] active expert count
-        weight_expert_ids: cute.Tensor,  # [E] local expert id -> global weight expert id
-        global_to_local_expert: cute.Tensor,  # [weight_E] global expert id -> local expert id
+        weight_expert_ids: cute.Tensor,  # [E] local expert id -> weight expert index
+        global_to_local_expert: cute.Tensor,  # [weight_E] weight expert index -> local expert id
         input_global_scale: cute.Tensor,  # [E] per-expert FC1 input scale
         alpha: cute.Tensor,
         down_alpha: cute.Tensor,
@@ -974,7 +995,9 @@ class MoEStaticKernel:
         total_pairs = Int32(topk_ids.shape[0])
         num_topk = total_pairs // num_tokens
         expert_scale_stride = Int32(scale_storage.shape[0]) // num_experts
-        num_global_experts = Int32(global_to_local_expert.shape[0])
+        # Number of experts materialized in the weight/scale tensors: the
+        # global expert count without EP, this rank's shard width with EP.
+        num_weight_experts = Int32(global_to_local_expert.shape[0])
         flat_tid = Int32(bidz) * Int32(self.threads_per_cta) + Int32(tidx)
         flat_stride = Int32(gdim_z) * Int32(self.threads_per_cta)
         num_k_tiles = (cols + Int32(63)) // Int32(64)
@@ -985,7 +1008,7 @@ class MoEStaticKernel:
             row_counts[i] = Int32(0)
             i += flat_stride
         i = flat_tid
-        while i < num_global_experts:
+        while i < num_weight_experts:
             global_to_local_expert[i] = Int32(-1)
             i += flat_stride
         if flat_tid == Int32(0):
@@ -1005,109 +1028,122 @@ class MoEStaticKernel:
 
         pair_idx = Int32(bidz)
         while pair_idx < total_pairs:
-            expert_id = topk_ids[pair_idx].to(Int32)
+            # Shift routed ids into the weight-expert index space. Under
+            # expert parallelism the weight/scale tensors hold only this
+            # rank's shard, so ids outside [0, num_weight_experts) belong to
+            # other ranks and the whole pair is skipped (uniform across the
+            # CTA — every thread computes the same id — so the skipped
+            # syncs below stay CTA-convergent). scatter_output was zeroed
+            # in Phase 0, so dropped pairs contribute exactly zero.
+            expert_id = topk_ids[pair_idx].to(Int32) - Int32(self.local_expert_offset)
             token_idx = pair_idx // num_topk
             weight = topk_weights[pair_idx].to(cutlass.Float32)
             local_expert_id = Int32(0)
             row = Int32(0)
-            if is_cta_leader > Int32(0):
-                prior_local_expert_id = _atomic_cas_global_i32(
-                    get_ptr_as_int64(global_to_local_expert, expert_id),
-                    Int32(-1),
-                    Int32(-2),
-                )
-                if prior_local_expert_id == Int32(-1):
-                    local_expert_id = atomic_add_global_i32(
-                        get_ptr_as_int64(active_expert_count, Int32(0)),
-                        Int32(1),
-                    )
-                    weight_expert_ids[local_expert_id] = expert_id
-                    _st_global_release_i32(
-                        get_ptr_as_int64(global_to_local_expert, expert_id),
-                        local_expert_id,
-                    )
-                else:
-                    if prior_local_expert_id == Int32(-2):
-                        # TODO: revisit whether we can replace this with a
-                        # weaker ordering path once the compact publish
-                        # sequence is better characterized.
-                        _spin_wait_global_eq_i32(
+            if expert_id >= Int32(0):
+                if expert_id < num_weight_experts:
+                    if is_cta_leader > Int32(0):
+                        prior_local_expert_id = _atomic_cas_global_i32(
                             get_ptr_as_int64(global_to_local_expert, expert_id),
+                            Int32(-1),
                             Int32(-2),
                         )
-                        prior_local_expert_id = _ld_global_acquire_i32(
-                            get_ptr_as_int64(global_to_local_expert, expert_id),
+                        if prior_local_expert_id == Int32(-1):
+                            local_expert_id = atomic_add_global_i32(
+                                get_ptr_as_int64(active_expert_count, Int32(0)),
+                                Int32(1),
+                            )
+                            weight_expert_ids[local_expert_id] = expert_id
+                            _st_global_release_i32(
+                                get_ptr_as_int64(global_to_local_expert, expert_id),
+                                local_expert_id,
+                            )
+                        else:
+                            if prior_local_expert_id == Int32(-2):
+                                # TODO: revisit whether we can replace this with a
+                                # weaker ordering path once the compact publish
+                                # sequence is better characterized.
+                                _spin_wait_global_eq_i32(
+                                    get_ptr_as_int64(global_to_local_expert, expert_id),
+                                    Int32(-2),
+                                )
+                                prior_local_expert_id = _ld_global_acquire_i32(
+                                    get_ptr_as_int64(global_to_local_expert, expert_id),
+                                )
+                            local_expert_id = prior_local_expert_id
+                        row = atomic_add_global_i32(
+                            get_ptr_as_int64(row_counts, local_expert_id),
+                            Int32(1),
                         )
-                    local_expert_id = prior_local_expert_id
-                row = atomic_add_global_i32(
-                    get_ptr_as_int64(row_counts, local_expert_id),
-                    Int32(1),
-                )
-                map_idx = local_expert_id * max_rows + row
-                st_global_i32(get_ptr_as_int64(token_map, map_idx), token_idx)
-                st_global_f32(get_ptr_as_int64(token_weights, map_idx), weight)
-                _st_shared_i32(ctrl_base_addr + Int32(0), local_expert_id)
-                _st_shared_i32(ctrl_base_addr + Int32(4), row)
-            cute.arch.sync_threads()
-            local_expert_id = _ld_shared_i32(ctrl_base_addr + Int32(0))
-            row = _ld_shared_i32(ctrl_base_addr + Int32(4))
+                        map_idx = local_expert_id * max_rows + row
+                        st_global_i32(get_ptr_as_int64(token_map, map_idx), token_idx)
+                        st_global_f32(get_ptr_as_int64(token_weights, map_idx), weight)
+                        _st_shared_i32(ctrl_base_addr + Int32(0), local_expert_id)
+                        _st_shared_i32(ctrl_base_addr + Int32(4), row)
+                    cute.arch.sync_threads()
+                    local_expert_id = _ld_shared_i32(ctrl_base_addr + Int32(0))
+                    row = _ld_shared_i32(ctrl_base_addr + Int32(4))
 
-            # Distribute quantization across ALL CTA threads, not just leader.
-            # Each FP4 block (16 elements) is independent — perfect parallelism.
-            gs_value = input_global_scale[expert_id].to(cutlass.Float32)
-            if self.input_scales_are_reciprocal and gs_value != cutlass.Float32(0.0):
-                if self.fast_math:
-                    gs_value = rcp_approx_ftz(gs_value)
-                else:
-                    gs_value = cutlass.Float32(1.0) / gs_value
-            sf_idx = Int32(tidx)
-            while sf_idx < sf_blocks_per_row:
-                block_start = sf_idx * Int32(16)
-                values = cute.make_rmem_tensor((16,), cutlass.Float32)
-                block_max = cutlass.Float32(0.0)
-                for elem_idx in cutlass.range_constexpr(16):
-                    value = cutlass.Float32(
-                        a_input[token_idx, block_start + Int32(elem_idx)]
-                    )
-                    values[elem_idx] = value
-                    block_max = fmax_f32(block_max, fabs_f32(value))
-                packed64 = Uint64(0)
-                scale_byte = Uint8(0)
-                if self.fast_math:
-                    packed64, scale_byte = quantize_block_fp4_fast(
-                        values, block_max, gs_value
-                    )
-                else:
-                    packed64, scale_byte = quantize_block_fp4(
-                        values, block_max, gs_value
-                    )
+                    # Distribute quantization across ALL CTA threads, not just
+                    # the leader. Each FP4 block (16 elements) is independent —
+                    # perfect parallelism.
+                    gs_value = input_global_scale[expert_id].to(cutlass.Float32)
+                    if self.input_scales_are_reciprocal and gs_value != cutlass.Float32(
+                        0.0
+                    ):
+                        if self.fast_math:
+                            gs_value = rcp_approx_ftz(gs_value)
+                        else:
+                            gs_value = cutlass.Float32(1.0) / gs_value
+                    sf_idx = Int32(tidx)
+                    while sf_idx < sf_blocks_per_row:
+                        block_start = sf_idx * Int32(16)
+                        values = cute.make_rmem_tensor((16,), cutlass.Float32)
+                        block_max = cutlass.Float32(0.0)
+                        for elem_idx in cutlass.range_constexpr(16):
+                            value = cutlass.Float32(
+                                a_input[token_idx, block_start + Int32(elem_idx)]
+                            )
+                            values[elem_idx] = value
+                            block_max = fmax_f32(block_max, fabs_f32(value))
+                        packed64 = Uint64(0)
+                        scale_byte = Uint8(0)
+                        if self.fast_math:
+                            packed64, scale_byte = quantize_block_fp4_fast(
+                                values, block_max, gs_value
+                            )
+                        else:
+                            packed64, scale_byte = quantize_block_fp4(
+                                values, block_max, gs_value
+                            )
 
-                output_offset = (
-                    local_expert_id * max_rows * output_bytes_per_row
-                    + row * output_bytes_per_row
-                    + sf_idx * Int32(8)
-                )
-                st_global_u64(
-                    get_ptr_as_int64(packed_a_storage, output_offset), packed64
-                )
+                        output_offset = (
+                            local_expert_id * max_rows * output_bytes_per_row
+                            + row * output_bytes_per_row
+                            + sf_idx * Int32(8)
+                        )
+                        st_global_u64(
+                            get_ptr_as_int64(packed_a_storage, output_offset),
+                            packed64,
+                        )
 
-                m_tile_idx = row // Int32(32 * 4)
-                k_tile_idx = sf_idx // Int32(4)
-                outer_m_idx = row % Int32(32)
-                inner_m_idx = (row % Int32(32 * 4)) // Int32(32)
-                inner_k_idx = sf_idx % Int32(4)
-                scale_offset = (
-                    local_expert_id * expert_scale_stride
-                    + m_tile_idx * num_k_tiles * Int32(32 * 4 * 4)
-                    + k_tile_idx * Int32(32 * 4 * 4)
-                    + outer_m_idx * Int32(4 * 4)
-                    + inner_m_idx * Int32(4)
-                    + inner_k_idx
-                )
-                scale_storage[scale_offset] = scale_byte
-                sf_idx += Int32(self.threads_per_cta)
+                        m_tile_idx = row // Int32(32 * 4)
+                        k_tile_idx = sf_idx // Int32(4)
+                        outer_m_idx = row % Int32(32)
+                        inner_m_idx = (row % Int32(32 * 4)) // Int32(32)
+                        inner_k_idx = sf_idx % Int32(4)
+                        scale_offset = (
+                            local_expert_id * expert_scale_stride
+                            + m_tile_idx * num_k_tiles * Int32(32 * 4 * 4)
+                            + k_tile_idx * Int32(32 * 4 * 4)
+                            + outer_m_idx * Int32(4 * 4)
+                            + inner_m_idx * Int32(4)
+                            + inner_k_idx
+                        )
+                        scale_storage[scale_offset] = scale_byte
+                        sf_idx += Int32(self.threads_per_cta)
 
-            cute.arch.sync_threads()
+                    cute.arch.sync_threads()
             pair_idx += Int32(gdim_z)
 
         self._resident_grid_barrier(

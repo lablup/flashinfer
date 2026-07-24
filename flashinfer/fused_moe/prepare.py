@@ -1093,3 +1093,304 @@ def prepare_b12x_w4a16_weights(
         "w2_weight_sf": w2_blockscale,
         "w2_alpha": w2_global_scale,
     }
+
+
+def _b12x_per_expert_global_scale(
+    global_scale: torch.Tensor, num_experts: int, name: str
+) -> torch.Tensor:
+    """Normalize a checkpoint global scale to a per-expert ``[E]`` fp32 tensor.
+
+    Accepts scalar/``[1]`` (broadcast), ``[E]``, or per-shard ``[E, S]``
+    (e.g. separate gate/up projection scales, collapsed like vLLM: take shard
+    0 after checking the shards agree).
+    """
+    gs = global_scale.to(torch.float32)
+    if gs.numel() == 1:
+        return gs.reshape(1).repeat(num_experts).contiguous()
+    if gs.dim() == 1 and gs.numel() == num_experts:
+        return gs.contiguous()
+    if gs.dim() == 2 and gs.size(0) == num_experts:
+        if not torch.allclose(gs, gs[:, :1].expand_as(gs)):
+            import warnings
+
+            warnings.warn(
+                f"{name} has per-shard values that disagree across shards; "
+                "using shard 0. Requantize with a single per-expert scale "
+                "for exact results.",
+                stacklevel=3,
+            )
+        return gs[:, 0].contiguous()
+    raise ValueError(
+        f"{name} must be scalar, [num_experts], or [num_experts, shards]; "
+        f"got shape {tuple(global_scale.shape)} for num_experts={num_experts}."
+    )
+
+
+def prepare_b12x_nvfp4_packed_weights(
+    w1_fp4: torch.Tensor,
+    w1_blockscale: torch.Tensor,
+    w1_global_scale: torch.Tensor,
+    w2_fp4: torch.Tensor,
+    w2_blockscale: torch.Tensor,
+    w2_global_scale: torch.Tensor,
+    *,
+    activation: str = "silu",
+    source_format: str = "modelopt",
+    a1_input_global_scale: Optional[torch.Tensor] = None,
+    a2_input_global_scale: Optional[torch.Tensor] = None,
+    w13_checkpoint_order: str = "up_gate",
+) -> Dict[str, torch.Tensor]:
+    """Build the SM12x NVFP4 (W4A4) weight view from packed checkpoint tensors.
+
+    Unlike :func:`prepare_b12x_nvfp4_weights` (which quantizes canonical BF16
+    weights), this ingests already-quantized FP4 checkpoint tensors — e.g. a
+    compressed-tensors ``nvfp4-pack-quantized`` or ModelOpt NVFP4 checkpoint —
+    and translates them into the kernel convention required by the b12x nvfp4
+    launch path:
+
+    - the per-expert weight global scale is baked into the block scales
+      (full dequant scales, ``weight ≈ fp4 * sf``), then the linear scales
+      are swizzled and converted to the 6D MMA layout;
+    - ``w1_alpha`` defaults to ones (it is aliased with the FC1 activation
+      quant global scale in-kernel and cancels exactly; a calibrated
+      activation scale only tunes the fp8 range of the dynamic per-block
+      activation scales);
+    - ``w2_alpha`` is set numerically equal to ``fc2_input_scale`` (kernel
+      invariant once weight scales are fully baked).
+
+    Parameters
+    ----------
+    w1_fp4 : Tensor
+        Packed FC1 expert weights ``[E, R1, H // 2]`` (uint8, two FP4 values
+        per byte), where ``R1 = 2 * I`` for gated activations (rows ordered
+        per ``w13_checkpoint_order``) or ``I`` for non-gated.
+    w1_blockscale : Tensor
+        Linear (row-major, unswizzled) FC1 block scales
+        ``[E, R1, H // 16]``, ``float8_e4m3fn``.
+    w1_global_scale : Tensor
+        FC1 weight global scale: scalar, per-expert ``[E]``, or per-shard
+        ``[E, 2]`` for gated checkpoints whose two projections were
+        quantized independently (columns follow the row-half order of
+        ``w1_fp4`` as passed, i.e. ``w13_checkpoint_order``). Per-shard
+        scales are baked exactly into their own row half. Convention per
+        ``source_format``.
+    w2_fp4 : Tensor
+        Packed FC2 expert weights ``[E, H, I // 2]`` (uint8).
+    w2_blockscale : Tensor
+        Linear FC2 block scales ``[E, H, I // 16]``, ``float8_e4m3fn``.
+    w2_global_scale : Tensor
+        Per-expert FC2 global scale (same accepted shapes as
+        ``w1_global_scale``).
+    activation : str
+        Kernel activation name: ``"silu"``, ``"gelu_tanh"``, or ``"relu2"``.
+    source_format : str
+        Checkpoint scale convention. ``"modelopt"``: global scales are
+        direct dequant multipliers (``weight_scale_2`` / ``input_scale``).
+        ``"compressed_tensors"``: global scales are stored as reciprocals
+        (``weight_global_scale = 448 * 6 / amax``) and are inverted here.
+    a1_input_global_scale : Tensor, optional
+        Calibrated FC1 input activation global scale (checkpoint
+        ``input_global_scale`` / ``input_scale``). Optional — the value
+        cancels in-kernel; when omitted, ones are used.
+    a2_input_global_scale : Tensor, optional
+        Calibrated FC2 input activation global scale (checkpoint
+        convention per ``source_format``). When omitted, ones are used.
+        The kernel quantizes FC2 inputs with dynamic per-block scales;
+        this global scale only positions the fp8 range of those block
+        scales. Whichever value best matches the actual runtime activation
+        magnitudes wins: ones is right for O(1) activations, while a
+        calibrated scale is right when runtime activations match
+        calibration — a badly mismatched value underflows (activations ≪
+        scale range → block scales round to zero) or saturates fp8.
+    w13_checkpoint_order : str
+        Row order of the gated ``w1`` checkpoint: ``"up_gate"`` (kernel
+        native, ``[up(0:I), gate(I:2I)]``) or ``"gate_up"`` (swapped here).
+
+    Returns
+    -------
+    dict
+        Keys expected by ``B12xMoEWrapper.run`` / ``B12xNvfp4Runner``:
+        ``w1_weight``, ``w1_weight_sf``, ``w1_alpha``, ``fc2_input_scale``,
+        ``w2_weight``, ``w2_weight_sf``, ``w2_alpha``.
+    """
+    from ..cute_dsl.utils import convert_sf_to_mma_layout
+    from .cute_dsl.blackwell_sm12x.moe_activation import is_gated_activation
+    from .cute_dsl.blackwell_sm12x.moe_source_format import (
+        _normalize_source_format,
+        _source_global_scale,
+    )
+    from .cute_dsl.blackwell_sm12x.moe_w4a16_fp4_helpers import swizzle_block_scale
+    from .cute_dsl.blackwell_sm12x.moe_w4a16_host import reorder_w13_to_gate_up
+
+    supported_activations = {"silu", "gelu_tanh", "relu2"}
+    if activation not in supported_activations:
+        raise ValueError(
+            f"unsupported b12x NVFP4 activation {activation!r}; expected one of "
+            f"{sorted(supported_activations)}."
+        )
+    source_format = _normalize_source_format(source_format)
+    if w13_checkpoint_order not in ("up_gate", "gate_up"):
+        raise ValueError(
+            "w13_checkpoint_order must be 'up_gate' or 'gate_up', "
+            f"got {w13_checkpoint_order!r}."
+        )
+
+    for name, t in (("w1_fp4", w1_fp4), ("w2_fp4", w2_fp4)):
+        if t.dtype != torch.uint8:
+            raise TypeError(f"{name} must be packed torch.uint8, got {t.dtype}.")
+    for name, t in (("w1_blockscale", w1_blockscale), ("w2_blockscale", w2_blockscale)):
+        if t.dtype != torch.float8_e4m3fn:
+            raise TypeError(f"{name} must be torch.float8_e4m3fn, got {t.dtype}.")
+
+    is_gated = is_gated_activation(activation)
+    if w2_fp4.dim() != 3:
+        raise ValueError(f"w2_fp4 must be [E, H, I // 2], got {tuple(w2_fp4.shape)}.")
+    num_experts, hidden_size = w2_fp4.size(0), w2_fp4.size(1)
+    intermediate_size = w2_fp4.size(2) * 2
+    w1_rows = intermediate_size * (2 if is_gated else 1)
+    if hidden_size % 16 != 0 or intermediate_size % 16 != 0:
+        raise ValueError("b12x NVFP4 dimensions must be multiples of 16.")
+    expected = {
+        "w1_fp4": (w1_fp4, (num_experts, w1_rows, hidden_size // 2)),
+        "w1_blockscale": (w1_blockscale, (num_experts, w1_rows, hidden_size // 16)),
+        "w2_blockscale": (
+            w2_blockscale,
+            (num_experts, hidden_size, intermediate_size // 16),
+        ),
+    }
+    for name, (t, shape) in expected.items():
+        if tuple(t.shape) != shape:
+            raise ValueError(f"expected {name} shape {shape}, got {tuple(t.shape)}.")
+
+    device = w1_fp4.device
+    for name, t in (
+        ("w1_blockscale", w1_blockscale),
+        ("w1_global_scale", w1_global_scale),
+        ("w2_fp4", w2_fp4),
+        ("w2_blockscale", w2_blockscale),
+        ("w2_global_scale", w2_global_scale),
+        ("a1_input_global_scale", a1_input_global_scale),
+        ("a2_input_global_scale", a2_input_global_scale),
+    ):
+        if t is not None and t.device != device:
+            raise ValueError(
+                f"{name} is on {t.device} but w1_fp4 is on {device}; all "
+                "inputs must share one device."
+            )
+
+    def _validated_descale(gs: torch.Tensor, name: str) -> torch.Tensor:
+        descale = _source_global_scale(gs, source_format=source_format)
+        if not bool(torch.isfinite(descale).all()) or not bool((descale > 0).all()):
+            raise ValueError(f"{name} must be finite and positive.")
+        return descale
+
+    def _per_row_weight_descale(
+        global_scale: torch.Tensor, num_shards: int, rows_per_shard: int, name: str
+    ) -> torch.Tensor:
+        """Per-row descale ``[E, num_shards * rows_per_shard, 1]``.
+
+        Accepts scalar/``[1]``, ``[E]``, or per-shard ``[E, num_shards]``
+        (e.g. separate up/gate projection scales in a fused checkpoint —
+        columns follow the row-half order of ``w1`` as passed, i.e.
+        ``w13_checkpoint_order``). Per-shard scales are baked exactly into
+        their own row half; no lossy collapse.
+        """
+        gs = global_scale.to(torch.float32)
+        if gs.numel() == 1:
+            per_shard = gs.reshape(1, 1).expand(num_experts, num_shards)
+        elif gs.dim() == 1 and gs.numel() == num_experts:
+            per_shard = gs.view(-1, 1).expand(num_experts, num_shards)
+        elif gs.dim() == 2 and gs.size(0) == num_experts and gs.size(1) == num_shards:
+            per_shard = gs
+        else:
+            raise ValueError(
+                f"{name} must be scalar, [num_experts], or "
+                f"[num_experts, {num_shards}]; got shape "
+                f"{tuple(global_scale.shape)} for num_experts={num_experts}."
+            )
+        descale = _validated_descale(per_shard.contiguous(), name)
+        return descale.repeat_interleave(rows_per_shard, dim=1).unsqueeze(-1)
+
+    # Descales are built in the CHECKPOINT row order and baked before any
+    # gate/up reorder, so per-shard scales stay attached to their rows.
+    d1_rows = _per_row_weight_descale(
+        w1_global_scale,
+        num_shards=2 if is_gated else 1,
+        rows_per_shard=intermediate_size,
+        name="w1_global_scale",
+    )
+    d2_rows = _per_row_weight_descale(
+        w2_global_scale,
+        num_shards=1,
+        rows_per_shard=hidden_size,
+        name="w2_global_scale",
+    )
+
+    def _bake(blockscale: torch.Tensor, descale_rows: torch.Tensor) -> torch.Tensor:
+        # Bake the weight global-scale descale into the block scales so they
+        # become full dequant scales (fp8 re-round, clamped to the e4m3 max).
+        return (
+            (blockscale.to(torch.float32) * descale_rows)
+            .clamp_(max=448.0)
+            .to(torch.float8_e4m3fn)
+        )
+
+    sf1_baked = _bake(w1_blockscale, d1_rows)
+    sf2_baked = _bake(w2_blockscale, d2_rows)
+
+    if w13_checkpoint_order == "gate_up":
+        if not is_gated:
+            raise ValueError(
+                "w13_checkpoint_order='gate_up' only applies to gated activations."
+            )
+        w1_fp4, sf1_baked = reorder_w13_to_gate_up(
+            w1_fp4, sf1_baked, intermediate_size=intermediate_size
+        )
+
+    def _to_mma(baked: torch.Tensor, rows: int, cols: int) -> torch.Tensor:
+        # Swizzle the linear layout, then convert to the 6D MMA layout the
+        # kernels consume. convert_sf_to_mma_layout requires swizzled input —
+        # feeding linear scales would be silently garbled.
+        swizzled = swizzle_block_scale(baked)
+        swizzled_2d = swizzled.reshape(
+            swizzled.size(0) * swizzled.size(1), swizzled.size(2)
+        )
+        return convert_sf_to_mma_layout(
+            swizzled_2d, m=rows, k=cols, num_groups=baked.size(0), sf_vec_size=16
+        )
+
+    w1_weight_sf = _to_mma(sf1_baked, w1_rows, hidden_size)
+    w2_weight_sf = _to_mma(sf2_baked, hidden_size, intermediate_size)
+
+    if a1_input_global_scale is not None:
+        w1_alpha = _validated_descale(
+            _b12x_per_expert_global_scale(
+                a1_input_global_scale, num_experts, "a1_input_global_scale"
+            ),
+            "a1_input_global_scale",
+        )
+    else:
+        w1_alpha = torch.ones(num_experts, device=device, dtype=torch.float32)
+
+    if a2_input_global_scale is not None:
+        fc2_input_scale = _validated_descale(
+            _b12x_per_expert_global_scale(
+                a2_input_global_scale, num_experts, "a2_input_global_scale"
+            ),
+            "a2_input_global_scale",
+        )
+    else:
+        fc2_input_scale = torch.ones(num_experts, device=device, dtype=torch.float32)
+    # Kernel invariant with fully-baked weight scales: the FC2 epilogue
+    # multiplier must equal the FC2 input-quant global scale.
+    w2_alpha = fc2_input_scale.clone()
+
+    return {
+        "w1_weight": w1_fp4.contiguous(),
+        "w1_weight_sf": w1_weight_sf,
+        "w1_alpha": w1_alpha.contiguous(),
+        "fc2_input_scale": fc2_input_scale.contiguous(),
+        "w2_weight": w2_fp4.contiguous(),
+        "w2_weight_sf": w2_weight_sf,
+        "w2_alpha": w2_alpha.contiguous(),
+    }
