@@ -37,13 +37,27 @@ Example (Wrapper API with CUDA Graph):
     >>> output = moe.run(x=hidden_states_bf16, ...)
 """
 
+import logging
+import os
 from typing import Any, Optional, Tuple
 
 import torch
 
+logger = logging.getLogger(__name__)
+
 from ...api_logging import flashinfer_api
 from ...trace.templates.moe import b12x_fused_moe_trace, b12x_moe_wrapper_run_trace
 from ...utils import supported_compute_capability
+
+# "0" disables the wrapper's in-place weight-padding rebind (see
+# B12xMoEWrapper.run): padded copies are then only cached on the wrapper and
+# the caller's original tensors stay alive, roughly doubling MoE weight
+# memory when the per-rank intermediate size is not a multiple of 128.
+_PAD_IN_PLACE_ENV = "FLASHINFER_B12X_PAD_IN_PLACE"
+
+
+def _pad_in_place_enabled() -> bool:
+    return os.environ.get(_PAD_IN_PLACE_ENV, "1") != "0"
 
 
 def _is_cuda_graph_capturing() -> bool:
@@ -604,6 +618,21 @@ class B12xMoEWrapper:
         -------
         torch.Tensor
             Output tensor of shape ``[num_tokens, hidden_size]``.
+
+        Notes
+        -----
+        When ``quant_mode="nvfp4"`` and the per-rank intermediate size is not
+        a multiple of 128, the weights must be zero-padded to the tile
+        boundary. On the first such call the wrapper builds padded copies and
+        **repoints the caller's weight tensors** (``w1_weight``,
+        ``w1_weight_sf``, ``w2_weight``, ``w2_weight_sf``) at the padded
+        storage via ``.data`` rebinding, so the unpadded originals can be
+        freed instead of staying resident next to the padded copies (which
+        would roughly double MoE weight memory). The caller-visible tensors
+        change shape along the intermediate dimension; the extra channels are
+        zero and the results are numerically identical. Set
+        ``FLASHINFER_B12X_PAD_IN_PLACE=0`` to disable the rebind and keep the
+        old keep-both-copies behavior.
         """
         num_tokens = token_selected_experts.size(0)
 
@@ -659,41 +688,80 @@ class B12xMoEWrapper:
                 workspace = self._static_workspace
 
         if self.quant_mode == "nvfp4":
-            # Cache weight views; invalidate if weight pointers change.
-            weight_key = (
-                self.quant_mode,
-                w1_weight.data_ptr(),
-                w1_weight_sf.data_ptr(),
-                w1_alpha.data_ptr(),
-                w2_weight.data_ptr(),
-                w2_weight_sf.data_ptr(),
-                w2_alpha.data_ptr(),
-            )
-            n_eff = self.intermediate_size
+            is_gated = is_gated_activation(self.activation)
+            # The effective intermediate size comes from the weight tensor,
+            # not the configured value: after an earlier in-place pad the
+            # caller's tensors are already tile-aligned while
+            # self.intermediate_size still holds the unpadded size (matching
+            # how launch_sm120_moe infers it).
+            n_eff = w1_weight.size(1) // 2 if is_gated else w1_weight.size(1)
             # Pad non-128-aligned intermediate sizes once and cache.
-            if self.intermediate_size % _LEVEL_TILE_N != 0:
+            if n_eff % _LEVEL_TILE_N != 0:
                 padded_weight_key = (
-                    *weight_key,
+                    self.quant_mode,
+                    w1_weight.data_ptr(),
+                    w1_weight_sf.data_ptr(),
+                    w1_alpha.data_ptr(),
+                    w2_weight.data_ptr(),
+                    w2_weight_sf.data_ptr(),
+                    w2_alpha.data_ptr(),
                     fc2_input_scale.data_ptr() if fc2_input_scale is not None else 0,
                 )
                 if (
                     self._padded_weights is None
                     or self._padded_weight_key != padded_weight_key
                 ):
-                    is_gated = is_gated_activation(self.activation)
-                    self._padded_weights = _pad_intermediate_to_tile(
-                        w1_weight,
-                        w1_weight_sf,
-                        w2_weight,
-                        w2_weight_sf,
-                        fc2_input_scale,
-                        self.intermediate_size,
-                        _LEVEL_TILE_N,
-                        self.hidden_size,
-                        w1_weight.size(0),
-                        is_gated,
-                    )
+                    # Build the padded copies as normal tensors even under
+                    # torch.inference_mode() (serving forward passes): they
+                    # replace the caller's load-time weights below, and
+                    # inference tensors would break any later
+                    # out-of-inference-mode weight mutation by the caller.
+                    with torch.inference_mode(False):
+                        self._padded_weights = _pad_intermediate_to_tile(
+                            w1_weight,
+                            w1_weight_sf,
+                            w2_weight,
+                            w2_weight_sf,
+                            fc2_input_scale,
+                            n_eff,
+                            _LEVEL_TILE_N,
+                            self.hidden_size,
+                            w1_weight.size(0),
+                            is_gated,
+                            cache=False,
+                        )
                     self._padded_weight_key = padded_weight_key
+                    if _pad_in_place_enabled():
+                        # Repoint the caller's tensors at the padded storage
+                        # so the unpadded originals can be freed. Callers
+                        # (e.g. vLLM) hold the weights for the process
+                        # lifetime and pass the same tensor objects every
+                        # call; without this, original + padded copy stay
+                        # resident together (~2.2x MoE weight memory —
+                        # Solar-Open2 TP4 lost ~41 GiB of KV cache to it).
+                        # Rebinding via .data mirrors how serving stacks
+                        # rewrite weights in process_weights_after_loading.
+                        # Later calls then arrive with tile-aligned tensors
+                        # and skip this branch; if the caller passes fresh
+                        # objects instead, the key above still matches and
+                        # the wrapper-held copy is reused as before.
+                        w1p, w1_sf_p, w2p, w2_sf_p, _, _ = self._padded_weights
+                        try:
+                            w1_weight.data = w1p
+                            w1_weight_sf.data = w1_sf_p
+                            w2_weight.data = w2p
+                            w2_weight_sf.data = w2_sf_p
+                        except RuntimeError as exc:
+                            # Keep serving off the wrapper-held padded copy —
+                            # correct but keeps the unpadded originals
+                            # resident too (~2x MoE weight memory), so warn.
+                            logger.warning(
+                                "B12xMoEWrapper: in-place weight-padding "
+                                "rebind failed (%s); falling back to cached "
+                                "padded copies. Original + padded weights "
+                                "will both stay resident.",
+                                exc,
+                            )
                 (
                     w1_weight,
                     w1_weight_sf,
@@ -703,6 +771,19 @@ class B12xMoEWrapper:
                     n_eff,
                 ) = self._padded_weights
 
+            # Cache weight views; invalidate if weight pointers change. Keyed
+            # AFTER padding so the key is stable across calls on both the
+            # rebind path (callers now pass the padded tensors) and the
+            # fallback path (wrapper-held padded tensors).
+            weight_key = (
+                self.quant_mode,
+                w1_weight.data_ptr(),
+                w1_weight_sf.data_ptr(),
+                w1_alpha.data_ptr(),
+                w2_weight.data_ptr(),
+                w2_weight_sf.data_ptr(),
+                w2_alpha.data_ptr(),
+            )
             if self._weight_views is None or self._weight_key != weight_key:
                 self._weight_views = _get_sm120_weight_views(
                     w1_fp4=w1_weight,

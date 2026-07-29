@@ -912,6 +912,70 @@ class TestB12xFunctional:
         passed, percent_within, atol = check_accuracy(result, ref_output)
         assert passed, f"Only {percent_within * 100:.2f}% within tol (atol={atol:.4f})"
 
+    @pytest.mark.parametrize("num_tokens", [8, 384])
+    def test_per_expert_fc2_scale_with_experts_equal_intermediate(
+        self, num_tokens: int
+    ):
+        """Regression: per-expert fc2_input_scale [E] survives intermediate
+        padding when E == intermediate_size.
+
+        Solar-Open2 under TP4 hits exactly this: 320 experts and a per-rank
+        intermediate of 1280/4 = 320 (% 128 != 0, so padding runs). The old
+        ``numel() == n`` heuristic in ``_pad_intermediate_to_tile`` misread
+        the per-expert scale as per-channel and padded it to [n_pad], which
+        the kernels rejected (``Mismatched global_scale.shape[0]``). Both
+        token counts matter: 8 stays on the static path, 384 (768 routed
+        pairs) crosses the dynamic cutover vLLM crashed on.
+        """
+        from flashinfer import b12x_fused_moe
+
+        hidden_size = 512
+        num_experts = intermediate_size = 192  # % 128 != 0 -> padding runs
+        top_k = 2
+        tensors = create_moe_tensors(
+            num_tokens=num_tokens,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_experts=num_experts,
+            num_local_experts=num_experts,
+            top_k=top_k,
+        )
+        # All-ones per-expert scale: numerically identical to the scalar the
+        # fixture builds, but shaped [E] like vLLM's a2_gscale.
+        fc2_per_expert = torch.ones(num_experts, dtype=torch.float32, device="cuda")
+        result = b12x_fused_moe(
+            x=tensors["x_bf16"],
+            w1_weight=tensors["w1_weight"],
+            w1_weight_sf=tensors["w1_weight_sf"],
+            w1_alpha=tensors["w1_alpha"],
+            fc2_input_scale=fc2_per_expert,
+            w2_weight=tensors["w2_weight"],
+            w2_weight_sf=tensors["w2_weight_sf"],
+            w2_alpha=tensors["w2_alpha"],
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+            num_experts=num_experts,
+            top_k=top_k,
+            num_local_experts=num_experts,
+        )
+        assert result.shape == (num_tokens, hidden_size)
+        assert not torch.isnan(result).any() and not torch.isinf(result).any()
+        ref_output = compute_reference_moe_fp4(
+            hidden_states=tensors["x_bf16"].float().cuda(),
+            gemm1_weights=tensors["w1_weight_bf16"].float().cuda(),
+            gemm2_weights=tensors["w2_weight_bf16"].float().cuda(),
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+            num_tokens=num_tokens,
+            num_experts=num_experts,
+            top_k=top_k,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            fc2_input_scale=tensors["fc2_input_scale"],
+        )
+        passed, percent_within, atol = check_accuracy(result, ref_output)
+        assert passed, f"Only {percent_within * 100:.2f}% within tol (atol={atol:.4f})"
+
     def test_activation_precision_api_validation(self):
         """W4A4 requires fc2_input_scale; W4A16 tolerates it."""
         from flashinfer import b12x_fused_moe
@@ -1249,6 +1313,139 @@ class TestB12xWrapper:
         )
         passed, percent_within, atol = check_accuracy(result, ref_output)
         assert passed, f"Only {percent_within * 100:.2f}% within tol (atol={atol:.4f})"
+
+    def test_wrapper_pad_in_place_rebinds_caller_tensors(self):
+        """In-place pad: the first run() repoints the caller's weight tensors
+        at the padded storage so the unpadded originals can be freed (vLLM
+        holds them for the process lifetime — Solar-Open2 TP4 lost ~41 GiB of
+        KV cache to the duplicate copies). Later calls arrive tile-aligned
+        and skip re-padding. Runs under torch.inference_mode() like a vLLM
+        forward; the rebound tensors must come out as NORMAL tensors so the
+        caller can still mutate weights outside inference mode.
+        """
+        from flashinfer import B12xMoEWrapper
+
+        num_tokens, hidden_size, intermediate_size = 128, 512, 704
+        num_experts, top_k = 8, 2
+        n_pad = 768
+        tensors = create_moe_tensors(
+            num_tokens=num_tokens,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_experts=num_experts,
+            num_local_experts=num_experts,
+            top_k=top_k,
+        )
+        moe = B12xMoEWrapper(
+            num_experts=num_experts,
+            top_k=top_k,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            use_cuda_graph=False,
+        )
+        w1, w1_sf = tensors["w1_weight"], tensors["w1_weight_sf"]
+        w2, w2_sf = tensors["w2_weight"], tensors["w2_weight_sf"]
+        orig_w1_ptr = w1.data_ptr()
+
+        def run():
+            return moe.run(
+                x=tensors["x_bf16"],
+                w1_weight=w1,
+                w1_weight_sf=w1_sf,
+                w1_alpha=tensors["w1_alpha"],
+                fc2_input_scale=tensors["fc2_input_scale"],
+                w2_weight=w2,
+                w2_weight_sf=w2_sf,
+                w2_alpha=tensors["w2_alpha"],
+                token_selected_experts=tensors["token_selected_experts"],
+                token_final_scales=tensors["token_final_scales"],
+            )
+
+        with torch.inference_mode():
+            result = run()
+
+        # Caller tensors were repointed at the padded storage.
+        assert w1.size(1) == 2 * n_pad
+        assert w1.data_ptr() != orig_w1_ptr
+        assert w2.size(2) == n_pad // 2
+        # Normal tensors, not inference tensors: the caller may still rebind
+        # or mutate its weights outside inference mode afterwards.
+        assert not w1.is_inference() and not w2.is_inference()
+        assert not w1_sf.is_inference() and not w2_sf.is_inference()
+
+        # The second call sees tile-aligned tensors and must not re-pad.
+        ptrs = (w1.data_ptr(), w1_sf.data_ptr(), w2.data_ptr(), w2_sf.data_ptr())
+        with torch.inference_mode():
+            result2 = run()
+        assert (
+            w1.data_ptr(),
+            w1_sf.data_ptr(),
+            w2.data_ptr(),
+            w2_sf.data_ptr(),
+        ) == ptrs
+
+        ref_output = compute_reference_moe_fp4(
+            hidden_states=tensors["x_bf16"].float().cuda(),
+            gemm1_weights=tensors["w1_weight_bf16"].float().cuda(),
+            gemm2_weights=tensors["w2_weight_bf16"].float().cuda(),
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+            num_tokens=num_tokens,
+            num_experts=num_experts,
+            top_k=top_k,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            fc2_input_scale=tensors["fc2_input_scale"],
+        )
+        for out in (result, result2):
+            passed, percent_within, atol = check_accuracy(out, ref_output)
+            assert passed, (
+                f"Only {percent_within * 100:.2f}% within tol (atol={atol:.4f})"
+            )
+
+    def test_wrapper_pad_in_place_disabled_by_env(self, monkeypatch):
+        """FLASHINFER_B12X_PAD_IN_PLACE=0 restores the keep-both-copies
+        behavior: caller tensors stay untouched and the wrapper serves off
+        its cached padded copy."""
+        from flashinfer import B12xMoEWrapper
+
+        monkeypatch.setenv("FLASHINFER_B12X_PAD_IN_PLACE", "0")
+
+        num_tokens, hidden_size, intermediate_size = 128, 512, 704
+        num_experts, top_k = 8, 2
+        tensors = create_moe_tensors(
+            num_tokens=num_tokens,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_experts=num_experts,
+            num_local_experts=num_experts,
+            top_k=top_k,
+        )
+        moe = B12xMoEWrapper(
+            num_experts=num_experts,
+            top_k=top_k,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            use_cuda_graph=False,
+        )
+        w1 = tensors["w1_weight"]
+        orig_shape, orig_ptr = tuple(w1.shape), w1.data_ptr()
+        result = moe.run(
+            x=tensors["x_bf16"],
+            w1_weight=w1,
+            w1_weight_sf=tensors["w1_weight_sf"],
+            w1_alpha=tensors["w1_alpha"],
+            fc2_input_scale=tensors["fc2_input_scale"],
+            w2_weight=tensors["w2_weight"],
+            w2_weight_sf=tensors["w2_weight_sf"],
+            w2_alpha=tensors["w2_alpha"],
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+        )
+        assert tuple(w1.shape) == orig_shape and w1.data_ptr() == orig_ptr
+        assert moe._padded_weights is not None
+        assert result.shape == (num_tokens, hidden_size)
+        assert not torch.isnan(result).any() and not torch.isinf(result).any()
 
     @pytest.mark.parametrize("num_tokens", [128, 256, 512])
     @pytest.mark.parametrize("top_k", [2, 8])
@@ -3806,6 +4003,49 @@ class TestB12xExpertParallel:
         torch.testing.assert_close(
             output.float(), functional.float(), atol=1e-2, rtol=1e-2
         )
+
+
+@cute_dsl_available
+@sm120_required
+@cuda_13_required
+class TestB12xKernelDiskCache:
+    """The B12x kernels persist through the CuTe-DSL disk cache."""
+
+    def test_dynamic_kernel_disk_roundtrip(self, monkeypatch):
+        """A compiled kernel is exported to disk and reloads without
+        recompiling: after priming, the in-memory L1 is cleared and
+        ``cute.compile`` is poisoned, so success proves the disk path."""
+        import cutlass.cute as cute
+
+        from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import (
+            moe_dispatch as md,
+        )
+        from flashinfer.jit.cute_dsl_core import cute_dsl_cache_disabled
+
+        if cute_dsl_cache_disabled():
+            pytest.skip("FLASHINFER_CUTE_DSL_DISABLE_CACHE=1")
+
+        config = dict(E=64, m=32, k=256, n=128, num_topk=2, max_rows=64)
+
+        def get():
+            return md._get_dynamic_kernel(
+                config["E"],
+                config["m"],
+                config["k"],
+                config["n"],
+                config["num_topk"],
+                config["max_rows"],
+            )
+
+        get()  # prime the disk cache (compiles on first-ever run)
+        md._DYNAMIC_KERNEL_CACHE.clear()
+
+        def _no_compile(*args, **kwargs):
+            raise AssertionError("cute.compile called despite a primed disk cache")
+
+        monkeypatch.setattr(cute, "compile", _no_compile)
+        compiled, mac = get()
+        assert compiled is not None and mac > 0
 
 
 if __name__ == "__main__":

@@ -68,6 +68,83 @@ _STATIC_COMPACT_CUTOVER_PAIRS_DEFAULT = 640
 _STATIC_COMPACT_CUTOVER_PAIRS = _STATIC_COMPACT_CUTOVER_PAIRS_DEFAULT
 _STATIC_COMPACT_CUTOVER_PAIRS_CACHE: Dict[str, int] = {}
 
+# Source files whose content invalidates the on-disk kernel cache. Everything
+# a compiled kernel's codegen can depend on: the kernel classes, the shared
+# device helpers they import, and this dispatch module (fake-tensor shapes and
+# compile options are defined here).
+_B12X_KERNEL_KEY_FILES: Tuple[str, ...] = ()
+
+
+def _b12x_kernel_key_files() -> Tuple[str, ...]:
+    global _B12X_KERNEL_KEY_FILES
+    if not _B12X_KERNEL_KEY_FILES:
+        from pathlib import Path
+
+        import flashinfer.cute_dsl.fp4_common as _fp4_common
+        import flashinfer.cute_dsl.utils as _cute_utils
+        import flashinfer.gemm.kernels.dense_blockscaled_gemm_sm120_b12x as _gemm
+
+        here = Path(__file__).resolve().parent
+        _B12X_KERNEL_KEY_FILES = tuple(
+            str(p)
+            for p in (
+                Path(__file__).resolve(),
+                here / "moe_static_kernel.py",
+                here / "moe_micro_kernel.py",
+                here / "moe_dynamic_kernel.py",
+                here / "moe_activation.py",
+                Path(_fp4_common.__file__).resolve(),
+                Path(_cute_utils.__file__).resolve(),
+                Path(_gemm.__file__).resolve(),
+            )
+        )
+    return _B12X_KERNEL_KEY_FILES
+
+
+def _compile_b12x_kernel(cache_key: Tuple, tag: str, compile_fn) -> Any:
+    """Compile a B12x MoE kernel through the persistent CuTe-DSL disk cache.
+
+    The in-memory ``_*_KERNEL_CACHE`` dicts remain the L1 cache; this adds the
+    ``cached_ops/b12x_moe_<arch>_cute_dsl/`` object-file cache underneath so
+    engine restarts (and pre-baked images) skip ``cute.compile`` entirely.
+    ``cache_key`` already encodes every compile-time input including the
+    device-dependent MAC, so its hash is the specialization identity; ``tag``
+    only makes the artifact filename human-readable.
+    """
+    import hashlib
+
+    from flashinfer.jit.core import MissingJITCacheError
+    from flashinfer.jit.cute_dsl_core import (
+        JitSpecCuteDsl,
+        _hash_source_files,
+        cute_dsl_cache_disabled,
+    )
+
+    if cute_dsl_cache_disabled():
+        return compile_fn()
+    try:
+        source_sha256 = _hash_source_files(_b12x_kernel_key_files())
+    except (OSError, TypeError):
+        return compile_fn()
+
+    digest = hashlib.sha256(repr(cache_key).encode()).hexdigest()[:16]
+    spec = JitSpecCuteDsl("b12x_moe", f"{tag}_{digest}", compile_fn, source_sha256)
+    kernel = spec.try_load()
+    if kernel is not None:
+        return kernel
+    if os.environ.get("FLASHINFER_DISABLE_JIT"):
+        raise MissingJITCacheError(
+            "JIT compilation is disabled via FLASHINFER_DISABLE_JIT but the "
+            f"B12x MoE kernel {spec.name} is not in the JIT cache.",
+            spec=spec,
+        )
+    # compile_and_persist (not build_and_load) so concurrent processes —
+    # warmup workers, TP ranks — compile in parallel instead of serializing
+    # on the module lock; the lock is only taken for the ~ms artifact export.
+    spec.compile_and_persist()
+    return spec.load()
+
+
 # MAC (max active clusters) tuning ladders from b12x decode profiling.
 # Each entry is (max_routed_rows, optimal_mac).
 _MICRO_MAC_LADDER: Tuple[Tuple[int, int], ...] = (
@@ -763,37 +840,42 @@ def _get_static_kernel(
         stride_order=(1, 0),
         assumed_align=16,
     )
-    compiled = cute.compile(
-        kernel,
-        a_input_fake,
-        topk_ids_fake,
-        topk_weights_fake,
-        packed_a_fake,
-        sfa_fake,
-        packed_a_storage_fake,
-        scale_storage_fake,
-        barrier_count_fake,
-        barrier_epoch_fake,
-        b_w13_fake,
-        sfb_w13_fake,
-        b_down_fake,
-        sfb_down_fake,
-        row_counts_fake,
-        active_expert_count_fake,
-        weight_expert_ids_fake,
-        global_to_local_expert_fake,
-        input_gs_fake,
-        alpha_fake,
-        down_alpha_fake,
-        global_scale_fake,
-        scatter_fake,
-        token_map_fake,
-        token_weights_fake,
-        mac,
-        current_cuda_stream(),
-        options="--opt-level 2 --enable-tvm-ffi",
-    )
 
+    def _compile() -> Any:
+        return cute.compile(
+            kernel,
+            a_input_fake,
+            topk_ids_fake,
+            topk_weights_fake,
+            packed_a_fake,
+            sfa_fake,
+            packed_a_storage_fake,
+            scale_storage_fake,
+            barrier_count_fake,
+            barrier_epoch_fake,
+            b_w13_fake,
+            sfb_w13_fake,
+            b_down_fake,
+            sfb_down_fake,
+            row_counts_fake,
+            active_expert_count_fake,
+            weight_expert_ids_fake,
+            global_to_local_expert_fake,
+            input_gs_fake,
+            alpha_fake,
+            down_alpha_fake,
+            global_scale_fake,
+            scatter_fake,
+            token_map_fake,
+            token_weights_fake,
+            mac,
+            current_cuda_stream(),
+            options="--opt-level 2 --enable-tvm-ffi",
+        )
+
+    compiled = _compile_b12x_kernel(
+        cache_key, f"static_E{weight_E}_n{n}_m{m}", _compile
+    )
     result = (compiled, mac)
     _STATIC_KERNEL_CACHE[cache_key] = result
     return result
@@ -1010,37 +1092,40 @@ def _get_micro_kernel(
         stride_order=(1, 0),
         assumed_align=16,
     )
-    compiled = cute.compile(
-        kernel,
-        a_input_fake,
-        topk_ids_fake,
-        topk_weights_fake,
-        packed_a_fake,
-        sfa_fake,
-        packed_a_storage_fake,
-        scale_storage_fake,
-        barrier_count_fake,
-        barrier_epoch_fake,
-        b_w13_fake,
-        sfb_w13_fake,
-        b_down_fake,
-        sfb_down_fake,
-        row_counts_fake,
-        active_expert_count_fake,
-        weight_expert_ids_fake,
-        global_to_local_expert_fake,
-        input_gs_fake,
-        alpha_fake,
-        down_alpha_fake,
-        global_scale_fake,
-        scatter_fake,
-        token_map_fake,
-        token_weights_fake,
-        mac,
-        current_cuda_stream(),
-        options="--opt-level 2 --enable-tvm-ffi",
-    )
 
+    def _compile() -> Any:
+        return cute.compile(
+            kernel,
+            a_input_fake,
+            topk_ids_fake,
+            topk_weights_fake,
+            packed_a_fake,
+            sfa_fake,
+            packed_a_storage_fake,
+            scale_storage_fake,
+            barrier_count_fake,
+            barrier_epoch_fake,
+            b_w13_fake,
+            sfb_w13_fake,
+            b_down_fake,
+            sfb_down_fake,
+            row_counts_fake,
+            active_expert_count_fake,
+            weight_expert_ids_fake,
+            global_to_local_expert_fake,
+            input_gs_fake,
+            alpha_fake,
+            down_alpha_fake,
+            global_scale_fake,
+            scatter_fake,
+            token_map_fake,
+            token_weights_fake,
+            mac,
+            current_cuda_stream(),
+            options="--opt-level 2 --enable-tvm-ffi",
+        )
+
+    compiled = _compile_b12x_kernel(cache_key, f"micro_E{weight_E}_n{n}_m{m}", _compile)
     result = (compiled, mac)
     _MICRO_KERNEL_CACHE[cache_key] = result
     return result
@@ -1850,53 +1935,55 @@ def _get_dynamic_kernel(
         alpha_dtype, 16, cute.AddressSpace.gmem, assumed_align=16
     )
 
-    compiled = cute.compile(
-        launch,
-        a_input_fake,
-        topk_ids_fake,
-        topk_weights_fake,
-        packed_a_fake,
-        sfa_fake,
-        packed_a_storage_fake,
-        scale_storage_fake,
-        barrier_count_fake,
-        barrier_epoch_fake,
-        pair_head_fake,
-        producers_done_count_fake,
-        all_work_published_fake,
-        task_head_fake,
-        task_tail_fake,
-        task_ready_fake,
-        task_expert_fake,
-        task_m_tile_fake,
-        task_slice_begin_fake,
-        task_slice_count_fake,
-        task_valid_rows_fake,
-        tile_write_count_fake,
-        b_w13_fake,
-        sfb_w13_fake,
-        b_down_fake,
-        sfb_down_fake,
-        row_counts_fake,
-        expert_write_rows_fake,
-        expert_tile_base_fake,
-        input_gs_fake,
-        alpha_fake,
-        down_alpha_fake,
-        global_scale_fake,
-        scatter_fake,
-        token_map_fake,
-        token_weights_fake,
-        1,
-        1,
-        1,
-        1,
-        1,  # runtime Int32 placeholders
-        mac,
-        current_cuda_stream(),
-        options="--opt-level 2 --enable-tvm-ffi",
-    )
+    def _compile() -> Any:
+        return cute.compile(
+            launch,
+            a_input_fake,
+            topk_ids_fake,
+            topk_weights_fake,
+            packed_a_fake,
+            sfa_fake,
+            packed_a_storage_fake,
+            scale_storage_fake,
+            barrier_count_fake,
+            barrier_epoch_fake,
+            pair_head_fake,
+            producers_done_count_fake,
+            all_work_published_fake,
+            task_head_fake,
+            task_tail_fake,
+            task_ready_fake,
+            task_expert_fake,
+            task_m_tile_fake,
+            task_slice_begin_fake,
+            task_slice_count_fake,
+            task_valid_rows_fake,
+            tile_write_count_fake,
+            b_w13_fake,
+            sfb_w13_fake,
+            b_down_fake,
+            sfb_down_fake,
+            row_counts_fake,
+            expert_write_rows_fake,
+            expert_tile_base_fake,
+            input_gs_fake,
+            alpha_fake,
+            down_alpha_fake,
+            global_scale_fake,
+            scatter_fake,
+            token_map_fake,
+            token_weights_fake,
+            1,
+            1,
+            1,
+            1,
+            1,  # runtime Int32 placeholders
+            mac,
+            current_cuda_stream(),
+            options="--opt-level 2 --enable-tvm-ffi",
+        )
 
+    compiled = _compile_b12x_kernel(cache_key, f"dynamic_E{E}_n{n}", _compile)
     result = (compiled, mac)
     _DYNAMIC_KERNEL_CACHE[cache_key] = result
     return result
@@ -2638,10 +2725,17 @@ def _pad_intermediate_to_tile(
     h,
     num_experts,
     is_gated,
+    cache: bool = True,
 ):
     """Zero-pad NVFP4 weights + scale factors so the intermediate size is a
     multiple of ``tile`` (gate/up tile-split requirement); padded channels are
     zero, so the result is numerically identical.
+
+    ``cache=False`` skips the module-level data_ptr-keyed cache. The wrapper
+    path must use it: it may repoint the caller's tensors at the padded
+    storage and free the originals, after which a data_ptr key here would
+    reference dead storage the allocator can hand to a different layer's
+    weights — a false cache hit returning the wrong experts.
     """
     n_pad = ((n + tile - 1) // tile) * tile
     if n_pad == n:
@@ -2660,9 +2754,10 @@ def _pad_intermediate_to_tile(
         w2_weight_sf.data_ptr(),
         fc2_input_scale_src.data_ptr() if fc2_input_scale_src is not None else 0,
     )
-    cached = _PADDED_WEIGHT_CACHE.get(key)
-    if cached is not None:
-        return cached
+    if cache:
+        cached = _PADDED_WEIGHT_CACHE.get(key)
+        if cached is not None:
+            return cached
 
     def mma_to_logical(sf, m, k):
         sw = convert_sf_from_mma_layout(sf, m=m, k=k, num_groups=E)
@@ -2708,19 +2803,24 @@ def _pad_intermediate_to_tile(
     cb_np = (n_pad + SF_VEC_SIZE - 1) // SF_VEC_SIZE
     w2_sf_p = logical_to_mma(pad_dim(log2, 2, cb_n, cb_np), m=h, k=n_pad)
 
-    if fc2_input_scale_src is not None and fc2_input_scale_src.numel() == n:
-        fc2_input_scale = pad_dim(fc2_input_scale_src, 0, n, n_pad)
-    result = (w1p, w1_sf_p, w2p, w2_sf_p, fc2_input_scale, n_pad)
-    _PADDED_WEIGHT_CACHE[key] = result
-    _register_cache_eviction(
-        _PADDED_WEIGHT_CACHE,
-        key,
-        w1_weight,
-        w1_weight_sf,
-        w2_weight,
-        w2_weight_sf,
-        fc2_input_scale_src,
-    )
+    # fc2_input_scale is scalar or per-expert [E] (see the launch_sm120_moe
+    # scale contract) and the expert count is unchanged by padding, so it
+    # passes through as-is. Do NOT treat numel() == n as "per-channel": when
+    # E == intermediate (e.g. Solar-Open2 under TP4: 320 experts, 1280/4=320
+    # per-rank intermediate) that misreads the per-expert scale and pads it
+    # off the kernel's compiled [E] binding.
+    result = (w1p, w1_sf_p, w2p, w2_sf_p, fc2_input_scale_src, n_pad)
+    if cache:
+        _PADDED_WEIGHT_CACHE[key] = result
+        _register_cache_eviction(
+            _PADDED_WEIGHT_CACHE,
+            key,
+            w1_weight,
+            w1_weight_sf,
+            w2_weight,
+            w2_weight_sf,
+            fc2_input_scale_src,
+        )
     return result
 
 
