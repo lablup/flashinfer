@@ -41,7 +41,10 @@ from .moe_w4a16_prepare import (
     W4A16PackedWeights,
     prepare_w4a16_packed_weights,
 )
-from .moe_source_format import _normalize_source_format
+from .moe_source_format import (
+    _normalize_source_format,
+    _validate_alphas_for_source_format,
+)
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -261,9 +264,18 @@ def _normalize_source_format_for_quant_mode(source_format: str, quant_mode: str)
     kernel convention (see ``launch_sm120_moe``). Convention translation for
     raw checkpoints lives in
     ``flashinfer.fused_moe.prepare.prepare_b12x_nvfp4_packed_weights``.
+
+    ``'fp4_e8m0_k32'`` (MXFP4) is W4A16-only: it has no global scales, and
+    the nvfp4 launch path has no translation step that could synthesize
+    them, so it is rejected for any other quant mode.
     """
-    del quant_mode  # accepted for all quant modes; kept for call-site clarity
-    return _normalize_source_format(source_format)
+    normalized = _normalize_source_format(source_format)
+    if normalized == "fp4_e8m0_k32" and quant_mode != "w4a16":
+        raise ValueError(
+            "source_format='fp4_e8m0_k32' (MXFP4) is only supported with "
+            f"quant_mode='w4a16', got quant_mode={quant_mode!r}."
+        )
+    return normalized
 
 
 def _is_w4a16(activation_precision: str) -> bool:
@@ -2343,30 +2355,28 @@ def _get_w4a16_packed_weights(
     *,
     w1_weight: torch.Tensor,
     w1_weight_sf: torch.Tensor,
-    w1_alpha: torch.Tensor,
+    w1_alpha: Optional[torch.Tensor],
     w2_weight: torch.Tensor,
     w2_weight_sf: torch.Tensor,
-    w2_alpha: torch.Tensor,
+    w2_alpha: Optional[torch.Tensor],
     activation: str,
     params_dtype: torch.dtype,
     source_format: str = "modelopt",
 ) -> W4A16PackedWeights:
+    def _key_part(t: Optional[torch.Tensor]):
+        # fp4_e8m0_k32 checkpoints carry no global scales (alphas are None).
+        return None if t is None else (tuple(t.shape), t.data_ptr())
+
     key = (
         activation,
         params_dtype,
         source_format,
-        tuple(w1_weight.shape),
-        tuple(w1_weight_sf.shape),
-        tuple(w1_alpha.shape),
-        tuple(w2_weight.shape),
-        tuple(w2_weight_sf.shape),
-        tuple(w2_alpha.shape),
-        w1_weight.data_ptr(),
-        w1_weight_sf.data_ptr(),
-        w1_alpha.data_ptr(),
-        w2_weight.data_ptr(),
-        w2_weight_sf.data_ptr(),
-        w2_alpha.data_ptr(),
+        _key_part(w1_weight),
+        _key_part(w1_weight_sf),
+        _key_part(w1_alpha),
+        _key_part(w2_weight),
+        _key_part(w2_weight_sf),
+        _key_part(w2_alpha),
     )
     cached = _W4A16_WEIGHT_CACHE.get(key)
     if cached is not None:
@@ -2447,10 +2457,10 @@ def _launch_sm120_w4a16_moe(
     topk_weights: torch.Tensor,
     w1_weight: torch.Tensor,
     w1_weight_sf: torch.Tensor,
-    w1_alpha: torch.Tensor,
+    w1_alpha: Optional[torch.Tensor],
     w2_weight: torch.Tensor,
     w2_weight_sf: torch.Tensor,
-    w2_alpha: torch.Tensor,
+    w2_alpha: Optional[torch.Tensor],
     num_experts: int,
     top_k: int,
     num_local_experts: int,
@@ -2831,11 +2841,11 @@ def launch_sm120_moe(
     topk_weights: torch.Tensor,
     w1_weight: torch.Tensor,
     w1_weight_sf: torch.Tensor,
-    w1_alpha: torch.Tensor,
+    w1_alpha: Optional[torch.Tensor],
     fc2_input_scale: Optional[torch.Tensor] = None,
     w2_weight: torch.Tensor,
     w2_weight_sf: torch.Tensor,
-    w2_alpha: torch.Tensor,
+    w2_alpha: Optional[torch.Tensor],
     num_experts: int,
     top_k: int,
     num_local_experts: int,
@@ -2899,6 +2909,9 @@ def launch_sm120_moe(
     quant_mode = _normalize_quant_mode(quant_mode, activation_precision)
     source_format = _normalize_source_format_for_quant_mode(source_format, quant_mode)
     activation_precision = _activation_precision_from_quant_mode(quant_mode)
+    _validate_alphas_for_source_format(
+        w1_alpha, w2_alpha, source_format=source_format
+    )
 
     if (
         quant_mode == "nvfp4"

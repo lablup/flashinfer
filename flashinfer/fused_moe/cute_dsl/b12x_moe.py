@@ -96,8 +96,8 @@ def b12x_fused_moe(
     num_experts: int,
     top_k: int,
     *,
-    w1_alpha: torch.Tensor,
-    w2_alpha: torch.Tensor,
+    w1_alpha: Optional[torch.Tensor] = None,
+    w2_alpha: Optional[torch.Tensor] = None,
     fc2_input_scale: Optional[torch.Tensor] = None,
     num_local_experts: Optional[int] = None,
     local_expert_offset: int = 0,
@@ -140,10 +140,13 @@ def b12x_fused_moe(
         Total number of experts.
     top_k : int
         Number of experts routed to per token.
-    w1_alpha : torch.Tensor
-        Per-expert global scale for FC1.
-    w2_alpha : torch.Tensor
-        Per-expert global scale for FC2.
+    w1_alpha : Optional[torch.Tensor]
+        Per-expert global scale for FC1.  Required for every source format
+        except ``"fp4_e8m0_k32"`` (MXFP4 checkpoints carry no global scales
+        — pass ``None`` there, and only there).
+    w2_alpha : Optional[torch.Tensor]
+        Per-expert global scale for FC2.  Same optionality contract as
+        ``w1_alpha``.
     fc2_input_scale : Optional[torch.Tensor]
         Global scale for FC2 input quantization.  Required for
         ``quant_mode="nvfp4"``; accepted but ignored for
@@ -583,8 +586,8 @@ class B12xMoEWrapper:
         token_selected_experts: torch.Tensor,
         token_final_scales: torch.Tensor,
         *,
-        w1_alpha: torch.Tensor,
-        w2_alpha: torch.Tensor,
+        w1_alpha: Optional[torch.Tensor] = None,
+        w2_alpha: Optional[torch.Tensor] = None,
         fc2_input_scale: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         r"""Run the b12x fused-MoE forward pass.
@@ -606,10 +609,13 @@ class B12xMoEWrapper:
             Expert assignments of shape ``[num_tokens, top_k]``.
         token_final_scales : torch.Tensor
             Routing weights of shape ``[num_tokens, top_k]``.
-        w1_alpha : torch.Tensor
-            Per-expert global scale for FC1.
-        w2_alpha : torch.Tensor
-            Per-expert global scale for FC2.
+        w1_alpha : Optional[torch.Tensor]
+            Per-expert global scale for FC1.  Required for every source
+            format except ``"fp4_e8m0_k32"`` (MXFP4 checkpoints carry no
+            global scales — pass ``None`` there, and only there).
+        w2_alpha : Optional[torch.Tensor]
+            Per-expert global scale for FC2.  Same optionality contract as
+            ``w1_alpha``.
         fc2_input_scale : Optional[torch.Tensor]
             Global scale for FC2 input quantization.  Required for
             ``quant_mode="nvfp4"``; accepted but ignored for ``"w4a16"``.
@@ -634,6 +640,16 @@ class B12xMoEWrapper:
         ``FLASHINFER_B12X_PAD_IN_PLACE=0`` to disable the rebind and keep the
         old keep-both-copies behavior.
         """
+        from .blackwell_sm12x.moe_source_format import (
+            _validate_alphas_for_source_format,
+        )
+
+        # Validate here (not just in launch_sm120_moe): the nvfp4 cache-key
+        # code below dereferences the alphas before launch.
+        _validate_alphas_for_source_format(
+            w1_alpha, w2_alpha, source_format=self.source_format
+        )
+
         num_tokens = token_selected_experts.size(0)
 
         if self.use_cuda_graph and num_tokens > self.max_num_tokens:

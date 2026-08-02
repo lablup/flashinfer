@@ -926,6 +926,144 @@ def create_b12x_ct_moe_tensors(
     }
 
 
+# E2M1 code -> value lookup (low 3 bits magnitude, bit 3 sign).
+_E2M1_VALUES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+_E2M1_TABLE = torch.tensor(
+    [v for v in _E2M1_VALUES] + [-v for v in _E2M1_VALUES], dtype=torch.float32
+)
+
+
+def dequant_mxfp4_reference(
+    packed: torch.Tensor, e8m0_scales: torch.Tensor
+) -> torch.Tensor:
+    """Exactly dequantize MXFP4: packed e2m1 nibbles x per-32-group e8m0 scales.
+
+    ``packed``: uint8 ``[..., cols // 2]``, low nibble = even element (the
+    OCP MXFP4 / fp4_quantize packing the W4A16 repack consumes).
+    ``e8m0_scales``: ``[..., cols // 32]``, float8_e8m0fnu or its uint8 view.
+    Returns float32 ``[..., cols]``.
+    """
+    lo = (packed & 0x0F).long()
+    hi = (packed >> 4).long()
+    codes = torch.stack([lo, hi], dim=-1).reshape(*packed.shape[:-1], -1)
+    values = _E2M1_TABLE.to(packed.device)[codes]
+    exp = e8m0_scales.view(torch.uint8).to(torch.int32) - 127
+    scales = torch.pow(
+        torch.tensor(2.0, dtype=torch.float32, device=packed.device),
+        exp.to(torch.float32),
+    )
+    return values * scales.repeat_interleave(32, dim=-1)
+
+
+def create_mxfp4_moe_tensors(
+    num_tokens: int,
+    hidden_size: int,
+    intermediate_size: int,
+    num_experts: int,
+    num_local_experts: int,
+    top_k: int,
+    device: str = "cuda",
+    seed: int = 42,
+):
+    """Create MXFP4 (``fp4_e8m0_k32``) checkpoint-convention MoE tensors.
+
+    Samples e2m1 codes and per-32-group power-of-two (e8m0) block scales
+    directly, so the packed tensors ARE the checkpoint and the bf16
+    reference weights are their exact dequantization (all products of e2m1
+    values and power-of-two scales are bf16-exact). The fused ``w13`` rows
+    are in kernel-native gate-first order (``[gate; up]``, vLLM's MXFP4
+    layout — no reorder is applied by the prepare path); the returned
+    ``w1_weight_bf16`` is converted to the reference's ``[up; gate]`` order.
+    Block-scale exponents span four octaves per matrix so the per-expert
+    global synthesis and block-ratio translation are genuinely exercised.
+    """
+    torch.manual_seed(seed)
+
+    x_bf16 = (
+        torch.randn(num_tokens, hidden_size, dtype=torch.bfloat16, device=device) / 10
+    )
+
+    router_logits = torch.randn(num_tokens, num_experts, device=device)
+    routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
+    routing_weights, selected_experts = torch.topk(routing_weights, top_k, dim=-1)
+    routing_weights = (
+        routing_weights / routing_weights.sum(dim=-1, keepdim=True)
+    ).float()
+    selected_experts = selected_experts.to(torch.int32)
+
+    E = num_local_experts
+    # Exponent bytes 121..125 -> scales 2^-6 .. 2^-2, keeping dequantized
+    # weights O(1) like the other fixtures' randn/10 weights.
+    w13_packed = torch.randint(
+        0, 256, (E, 2 * intermediate_size, hidden_size // 2),
+        dtype=torch.uint8, device=device,
+    )
+    w13_blockscale = torch.randint(
+        121, 126, (E, 2 * intermediate_size, hidden_size // 32),
+        dtype=torch.uint8, device=device,
+    ).view(torch.float8_e8m0fnu)
+    w2_packed = torch.randint(
+        0, 256, (E, hidden_size, intermediate_size // 2),
+        dtype=torch.uint8, device=device,
+    )
+    w2_blockscale = torch.randint(
+        121, 126, (E, hidden_size, intermediate_size // 32),
+        dtype=torch.uint8, device=device,
+    ).view(torch.float8_e8m0fnu)
+
+    w13_gate_first = dequant_mxfp4_reference(w13_packed, w13_blockscale)
+    # Reference layout is [up(linear); gate].
+    w1_weight_bf16 = torch.cat(
+        [
+            w13_gate_first[:, intermediate_size:],
+            w13_gate_first[:, :intermediate_size],
+        ],
+        dim=1,
+    ).to(torch.bfloat16)
+    w2_weight_bf16 = dequant_mxfp4_reference(w2_packed, w2_blockscale).to(
+        torch.bfloat16
+    )
+
+    return {
+        "x_bf16": x_bf16,
+        "token_selected_experts": selected_experts,
+        "token_final_scales": routing_weights,
+        "w1_weight": w13_packed,
+        "w1_weight_sf": w13_blockscale,
+        "w2_weight": w2_packed,
+        "w2_weight_sf": w2_blockscale,
+        "w1_weight_bf16": w1_weight_bf16,
+        "w2_weight_bf16": w2_weight_bf16,
+    }
+
+
+def slice_mxfp4_moe_tensors_for_ep(
+    tensors: dict,
+    local_expert_offset: int,
+    num_local_experts: int,
+) -> dict:
+    """Build one EP rank's MXFP4 shard from full-model tensors.
+
+    MXFP4 tensors all have the expert dimension leading and per-expert
+    globals are synthesized downstream from each shard's own block scales,
+    so slicing is exact — the shard computes bitwise the same expert math
+    as the full run.
+    """
+    s = int(local_expert_offset)
+    e = s + int(num_local_experts)
+    shard = dict(tensors)
+    for name in (
+        "w1_weight",
+        "w1_weight_sf",
+        "w2_weight",
+        "w2_weight_sf",
+        "w1_weight_bf16",
+        "w2_weight_bf16",
+    ):
+        shard[name] = tensors[name][s:e].contiguous()
+    return shard
+
+
 def create_relu2_moe_tensors(
     num_tokens: int,
     hidden_size: int,

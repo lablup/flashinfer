@@ -4008,6 +4008,184 @@ class TestB12xExpertParallel:
 @cute_dsl_available
 @sm120_required
 @cuda_13_required
+class TestB12xMxfp4W4A16:
+    """MXFP4 (``fp4_e8m0_k32``) checkpoints through the W4A16 path.
+
+    MXFP4 tensors are plain e8m0 32-group block scales with NO global scales
+    and kernel-native gate-first fused rows (vLLM's layout) — the prepare
+    path synthesizes per-expert globals and skips unswizzle/reorder. The
+    fixture samples e2m1 codes and power-of-two scales directly, so the
+    reference weights are the checkpoint's exact dequantization.
+    """
+
+    def _run_functional(self, tensors, num_experts, top_k, **kwargs):
+        from flashinfer import b12x_fused_moe
+
+        return b12x_fused_moe(
+            x=tensors["x_bf16"],
+            w1_weight=tensors["w1_weight"],
+            w1_weight_sf=tensors["w1_weight_sf"],
+            w2_weight=tensors["w2_weight"],
+            w2_weight_sf=tensors["w2_weight_sf"],
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+            num_experts=num_experts,
+            top_k=top_k,
+            quant_mode="w4a16",
+            source_format="fp4_e8m0_k32",
+            **kwargs,
+        )
+
+    def _reference(self, tensors, num_tokens, num_experts, top_k, h, i, **kwargs):
+        return compute_reference_moe_fp4(
+            hidden_states=tensors["x_bf16"].float().cuda(),
+            gemm1_weights=tensors["w1_weight_bf16"].float().cuda(),
+            gemm2_weights=tensors["w2_weight_bf16"].float().cuda(),
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+            num_tokens=num_tokens,
+            num_experts=num_experts,
+            top_k=top_k,
+            hidden_size=h,
+            intermediate_size=i,
+            fc2_input_scale=None,
+            **kwargs,
+        )
+
+    @pytest.mark.parametrize("num_tokens", [64, 384])
+    def test_mxfp4_functional_accuracy(self, num_tokens: int):
+        """MXFP4 W4A16 accuracy vs exact-dequant reference (alphas omitted)."""
+        from .utils import create_mxfp4_moe_tensors
+
+        hidden_size, intermediate_size = 256, 512
+        num_experts, top_k = 64, 2
+        tensors = create_mxfp4_moe_tensors(
+            num_tokens=num_tokens,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_experts=num_experts,
+            num_local_experts=num_experts,
+            top_k=top_k,
+            seed=321,
+        )
+
+        result = self._run_functional(tensors, num_experts, top_k)
+        assert result.shape == (num_tokens, hidden_size)
+        assert not torch.isnan(result).any() and not torch.isinf(result).any()
+
+        ref_output = self._reference(
+            tensors, num_tokens, num_experts, top_k, hidden_size, intermediate_size
+        )
+        passed, percent_within, atol = check_accuracy(result, ref_output)
+        assert passed, (
+            f"MXFP4 W4A16: {percent_within * 100:.2f}% within tolerance "
+            f"(atol={atol:.4f}, tokens={num_tokens})"
+        )
+
+    def test_mxfp4_expert_parallel_partials_match_full(self):
+        """EP shard partial sums reproduce the full MXFP4 run and reference.
+
+        This is the configuration DeepSeek-V4-Flash needs: an MXFP4
+        checkpoint served through the EP-capable b12x path (global routing
+        ids, per-rank weight slices, caller-side sum). MXFP4 shards are
+        bitwise slices (per-expert globals are synthesized per shard from
+        the same block scales), so EP-sum vs full differs only by scheduler
+        and summation order.
+        """
+        from .utils import create_mxfp4_moe_tensors, slice_mxfp4_moe_tensors_for_ep
+
+        num_tokens, hidden_size, intermediate_size = 128, 256, 512
+        num_experts, top_k, ep_size = 64, 4, 4
+        tensors = create_mxfp4_moe_tensors(
+            num_tokens=num_tokens,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_experts=num_experts,
+            num_local_experts=num_experts,
+            top_k=top_k,
+            seed=654,
+        )
+
+        full = self._run_functional(tensors, num_experts, top_k)
+
+        n_local = num_experts // ep_size
+        ep_sum = None
+        for rank in range(ep_size):
+            shard = slice_mxfp4_moe_tensors_for_ep(
+                tensors,
+                local_expert_offset=rank * n_local,
+                num_local_experts=n_local,
+            )
+            partial = self._run_functional(
+                shard,
+                num_experts,
+                top_k,
+                num_local_experts=n_local,
+                local_expert_offset=rank * n_local,
+            )
+            ep_sum = partial.float() if ep_sum is None else ep_sum + partial.float()
+
+        TestB12xExpertParallel._assert_partials_match_full(ep_sum, full)
+
+        ref_output = self._reference(
+            tensors, num_tokens, num_experts, top_k, hidden_size, intermediate_size
+        )
+        passed, percent_within, atol = check_accuracy(ep_sum, ref_output)
+        assert passed, (
+            f"MXFP4 EP sum vs reference: {percent_within * 100:.2f}% within "
+            f"tolerance (atol={atol:.4f})"
+        )
+
+    def test_mxfp4_alpha_contract_validation(self):
+        """MXFP4 forbids alphas; other formats require them; nvfp4 rejects MXFP4."""
+        from flashinfer import b12x_fused_moe
+        from .utils import create_mxfp4_moe_tensors
+
+        num_tokens, hidden_size, intermediate_size = 4, 256, 512
+        num_experts, top_k = 64, 2
+        tensors = create_mxfp4_moe_tensors(
+            num_tokens=num_tokens,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_experts=num_experts,
+            num_local_experts=num_experts,
+            top_k=top_k,
+        )
+        kwargs = dict(
+            x=tensors["x_bf16"],
+            w1_weight=tensors["w1_weight"],
+            w1_weight_sf=tensors["w1_weight_sf"],
+            w2_weight=tensors["w2_weight"],
+            w2_weight_sf=tensors["w2_weight_sf"],
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+            num_experts=num_experts,
+            top_k=top_k,
+        )
+        ones = torch.ones(num_experts, dtype=torch.float32, device="cuda")
+
+        # MXFP4 + alphas -> rejected.
+        with pytest.raises(ValueError, match="carries no global scales"):
+            b12x_fused_moe(
+                **kwargs,
+                quant_mode="w4a16",
+                source_format="mxfp4",
+                w1_alpha=ones,
+                w2_alpha=ones,
+            )
+        # Non-MXFP4 formats still require alphas.
+        with pytest.raises(ValueError, match="w1_alpha and w2_alpha are required"):
+            b12x_fused_moe(**kwargs, quant_mode="w4a16", source_format="modelopt")
+        # MXFP4 is W4A16-only.
+        with pytest.raises(ValueError, match="only supported with"):
+            b12x_fused_moe(
+                **kwargs, quant_mode="nvfp4", source_format="fp4_e8m0_k32"
+            )
+
+
+@cute_dsl_available
+@sm120_required
+@cuda_13_required
 class TestB12xKernelDiskCache:
     """The B12x kernels persist through the CuTe-DSL disk cache."""
 

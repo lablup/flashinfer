@@ -81,6 +81,56 @@ def _permute_packed_scales(
     return scales.reshape((-1, size_n)).contiguous()
 
 
+def _e8m0_expert_scales_to_nvfp4(
+    blockscale: torch.Tensor,
+    *,
+    num_experts: int,
+    rows: int,
+    cols: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Translate plain MXFP4 ``e8m0`` 32-group scales into the
+    ``(e4m3 16-group, fp32 per-expert global)`` convention consumed by the
+    W4A16 packing path.
+
+    e8m0 scales are pure powers of two, so with the per-expert global chosen
+    as ``2**(emax - 8)`` every block ratio is a power of two in ``(0, 256]``
+    — exactly representable in ``e4m3``. The downstream packing
+    (``_process_nvfp4_packed_scales``) flushes ratios below ``2**-6`` to
+    zero, so the translation is lossless for per-expert scale spreads up to
+    ``2**14``; blocks more than 14 octaves below their expert's max scale
+    (not observed in real checkpoints) flush to zero there, mirroring what
+    the modelopt path does to equally extreme block scales. Each 32-group
+    scale is duplicated into its two 16-group halves.
+    """
+    if cols % 32 != 0:
+        raise ValueError(
+            f"fp4_e8m0_k32 block scales require cols % 32 == 0, got {cols}"
+        )
+    if blockscale.dtype == torch.uint8:
+        exp_bytes = blockscale
+    elif blockscale.dtype == torch.float8_e8m0fnu:
+        exp_bytes = blockscale.view(torch.uint8)
+    else:
+        raise TypeError(
+            "fp4_e8m0_k32 block scales must be torch.float8_e8m0fnu (or its "
+            f"uint8 view), got {blockscale.dtype}"
+        )
+    expected = (int(num_experts), int(rows), int(cols) // 32)
+    if tuple(exp_bytes.shape) != expected:
+        raise ValueError(
+            f"expected plain fp4_e8m0_k32 block scales of shape {expected}, "
+            f"got {tuple(exp_bytes.shape)}"
+        )
+    two = torch.tensor(2.0, dtype=torch.float32, device=exp_bytes.device)
+    exp = exp_bytes.to(torch.int32) - 127
+    emax = exp.amax(dim=(1, 2))
+    global_scale = torch.pow(two, (emax - 8).to(torch.float32)).contiguous()
+    # e4m3 bottoms out at 2**-9 (subnormal); clamp so no block flushes to 0.
+    block_exp = (exp - emax.view(-1, 1, 1) + 8).clamp_min(-9)
+    block = torch.pow(two, block_exp.to(torch.float32)).to(torch.float8_e4m3fn)
+    return block.repeat_interleave(2, dim=2).contiguous(), global_scale
+
+
 def _nvfp4_compute_scale_factor(
     packed_scales: torch.Tensor,
     a_dtype: torch.dtype,
@@ -234,16 +284,42 @@ def _permute_nvfp4_scales(
 def prepare_w4a16_packed_weights(
     w13_fp4: torch.Tensor,
     w13_blockscale: torch.Tensor,
-    w13_global_scale: torch.Tensor,
+    w13_global_scale: torch.Tensor | None,
     w2_fp4: torch.Tensor,
     w2_blockscale: torch.Tensor,
-    w2_global_scale: torch.Tensor,
+    w2_global_scale: torch.Tensor | None,
     *,
     activation: str,
     params_dtype: torch.dtype = torch.bfloat16,
     source_format: str = "modelopt",
 ) -> W4A16PackedWeights:
     source_format = _normalize_source_format(source_format)
+    is_e8m0 = source_format == "fp4_e8m0_k32"
+    if is_e8m0:
+        if w13_global_scale is not None or w2_global_scale is not None:
+            raise ValueError(
+                "fp4_e8m0_k32 checkpoints carry no global scales; pass "
+                "w13_global_scale=None and w2_global_scale=None (per-expert "
+                "globals are synthesized from the e8m0 block scales)"
+            )
+        # Shapes are needed before validation because the synthesized fp32
+        # globals participate in it.
+        e8m0_num_experts = int(w13_fp4.shape[0])
+        e8m0_hidden = int(w2_fp4.shape[1])
+        e8m0_intermediate = int(w2_fp4.shape[2] * 2)
+        e8m0_w13_rows = int(w13_fp4.shape[1])
+        w13_scale_plain, w13_global_scale = _e8m0_expert_scales_to_nvfp4(
+            w13_blockscale,
+            num_experts=e8m0_num_experts,
+            rows=e8m0_w13_rows,
+            cols=e8m0_hidden,
+        )
+        w2_scale_plain, w2_global_scale = _e8m0_expert_scales_to_nvfp4(
+            w2_blockscale,
+            num_experts=e8m0_num_experts,
+            rows=e8m0_hidden,
+            cols=e8m0_intermediate,
+        )
     shape = validate_w4a16_packed_inputs(
         w13_fp4,
         w13_global_scale,
@@ -258,33 +334,40 @@ def prepare_w4a16_packed_weights(
     is_gated = shape.is_gated
 
     w13 = w13_fp4
-    w13_scale = unswizzle_expert_scales(
-        normalize_expert_block_scales(
-            w13_blockscale,
-            num_experts=num_experts,
+    if is_e8m0:
+        # Plain per-expert scales; the fused w13 rows are already in
+        # kernel-native gate-first order (vLLM's MXFP4 layout), so neither
+        # unswizzling nor the up_gate -> gate_up reorder applies.
+        w13_scale = w13_scale_plain
+        w2_scale = w2_scale_plain
+    else:
+        w13_scale = unswizzle_expert_scales(
+            normalize_expert_block_scales(
+                w13_blockscale,
+                num_experts=num_experts,
+                rows=w13_rows,
+                cols=hidden_size,
+            ),
             rows=w13_rows,
             cols=hidden_size,
-        ),
-        rows=w13_rows,
-        cols=hidden_size,
-    )
-    if is_gated:
-        w13, w13_scale = reorder_w13_to_gate_up(
-            w13,
-            w13_scale,
-            intermediate_size=intermediate_size,
         )
+        if is_gated:
+            w13, w13_scale = reorder_w13_to_gate_up(
+                w13,
+                w13_scale,
+                intermediate_size=intermediate_size,
+            )
 
-    w2_scale = unswizzle_expert_scales(
-        normalize_expert_block_scales(
-            w2_blockscale,
-            num_experts=num_experts,
+        w2_scale = unswizzle_expert_scales(
+            normalize_expert_block_scales(
+                w2_blockscale,
+                num_experts=num_experts,
+                rows=hidden_size,
+                cols=intermediate_size,
+            ),
             rows=hidden_size,
             cols=intermediate_size,
-        ),
-        rows=hidden_size,
-        cols=intermediate_size,
-    )
+        )
 
     packed_w13 = _repack_weight(w13.contiguous(), size_k=hidden_size, size_n=w13_rows)
     packed_w2 = _repack_weight(
