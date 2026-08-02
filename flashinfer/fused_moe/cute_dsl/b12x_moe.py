@@ -464,9 +464,59 @@ class B12xMoEWrapper:
         self._padded_weights: Any = None
         self._padded_weight_key: Optional[Tuple] = None
         self._moe_output: Optional[torch.Tensor] = None
+        self._prepared_w4a16: Any = None
 
         if use_cuda_graph:
             self._allocate_buffers()
+
+    @flashinfer_api
+    def prepare_w4a16_weights(
+        self,
+        w1_weight: torch.Tensor,
+        w1_weight_sf: torch.Tensor,
+        w2_weight: torch.Tensor,
+        w2_weight_sf: torch.Tensor,
+        *,
+        w1_alpha: Optional[torch.Tensor] = None,
+        w2_alpha: Optional[torch.Tensor] = None,
+    ) -> None:
+        r"""Eagerly build and hold this wrapper's W4A16 packed weights.
+
+        The packed representation is stored on the wrapper and used by every
+        subsequent :meth:`run` call, so the caller may FREE the raw
+        checkpoint tensors afterwards — unlike the internal module-level
+        cache, which is weakref-evicted when its source tensors are
+        collected and therefore requires them to stay alive. Serving stacks
+        need this to avoid holding raw + packed MoE weights resident
+        together (~2x MoE weight memory, an OOM at DeepSeek-V4-Flash scale).
+
+        Only valid for ``quant_mode="w4a16"``. Alphas follow the source
+        format's contract (``None`` for ``fp4_e8m0_k32``).
+        """
+        if self.quant_mode != "w4a16":
+            raise ValueError(
+                "prepare_w4a16_weights requires quant_mode='w4a16', got "
+                f"{self.quant_mode!r}"
+            )
+        from .blackwell_sm12x.moe_source_format import (
+            _validate_alphas_for_source_format,
+        )
+        from .blackwell_sm12x.moe_w4a16_prepare import prepare_w4a16_packed_weights
+
+        _validate_alphas_for_source_format(
+            w1_alpha, w2_alpha, source_format=self.source_format
+        )
+        self._prepared_w4a16 = prepare_w4a16_packed_weights(
+            w1_weight,
+            w1_weight_sf,
+            w1_alpha,
+            w2_weight,
+            w2_weight_sf,
+            w2_alpha,
+            activation=self.activation,
+            params_dtype=self.output_dtype,
+            source_format=self.source_format,
+        )
 
     def _allocate_buffers(self) -> None:
         """Pre-allocate buffers for CUDA graph compatibility."""
@@ -842,4 +892,5 @@ class B12xMoEWrapper:
             source_format=self.source_format,
             _workspace=workspace,
             _weight_views=self._weight_views,
+            _prepared_weights=self._prepared_w4a16,
         )

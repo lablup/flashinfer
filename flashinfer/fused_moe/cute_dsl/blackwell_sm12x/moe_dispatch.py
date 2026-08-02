@@ -2950,9 +2950,16 @@ def launch_sm120_moe(
     num_tokens = topk_ids.size(0)
     k = a.size(1)  # hidden_size
     is_gated = is_gated_activation(activation)
-    # w1_weight.size(1) is 2*n for gated or n for non-gated
-    intermediate_size = w1_weight.size(1) // 2 if is_gated else w1_weight.size(1)
-    n = intermediate_size
+    if quant_mode == "w4a16" and w1_weight.dim() != 3:
+        # Callers on the prepared-weights path (B12xMoEWrapper.
+        # prepare_w4a16_weights) may have released the raw checkpoint
+        # tensors and pass empty placeholders; the W4A16 branch reads its
+        # geometry from the prepared pack instead.
+        n = intermediate_size = 0
+    else:
+        # w1_weight.size(1) is 2*n for gated or n for non-gated
+        intermediate_size = w1_weight.size(1) // 2 if is_gated else w1_weight.size(1)
+        n = intermediate_size
 
     # NVFP4 kernels need padded intermediate size.
     if quant_mode != "w4a16" and n % _LEVEL_TILE_N != 0 and _weight_views is None:

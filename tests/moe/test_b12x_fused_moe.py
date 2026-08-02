@@ -4136,6 +4136,61 @@ class TestB12xMxfp4W4A16:
             f"tolerance (atol={atol:.4f})"
         )
 
+    def test_mxfp4_wrapper_prepared_weights_survive_source_release(self):
+        """prepare_w4a16_weights holds the pack so callers can free sources.
+
+        Serving stacks (vLLM) must not keep raw + packed MoE weights resident
+        together (~2x MoE weight memory — an OOM at DeepSeek-V4-Flash scale),
+        so the wrapper prepares eagerly and later run() calls must work with
+        released (empty placeholder) weight arguments.
+        """
+        from flashinfer.fused_moe import B12xMoEWrapper
+        from .utils import create_mxfp4_moe_tensors
+
+        num_tokens, hidden_size, intermediate_size = 32, 256, 512
+        num_experts, top_k = 64, 2
+        tensors = create_mxfp4_moe_tensors(
+            num_tokens=num_tokens,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_experts=num_experts,
+            num_local_experts=num_experts,
+            top_k=top_k,
+            seed=987,
+        )
+
+        baseline = self._run_functional(tensors, num_experts, top_k)
+
+        moe = B12xMoEWrapper(
+            num_experts=num_experts,
+            top_k=top_k,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            quant_mode="w4a16",
+            source_format="fp4_e8m0_k32",
+        )
+        moe.prepare_w4a16_weights(
+            tensors["w1_weight"],
+            tensors["w1_weight_sf"],
+            tensors["w2_weight"],
+            tensors["w2_weight_sf"],
+        )
+        # Simulate the caller releasing the checkpoint tensors.
+        empty = torch.empty((0,), dtype=torch.uint8, device="cuda")
+        result = moe.run(
+            x=tensors["x_bf16"],
+            w1_weight=empty,
+            w1_weight_sf=empty,
+            w2_weight=empty,
+            w2_weight_sf=empty,
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+        )
+        # Same kernel and same prepared pack: only scatter ordering differs.
+        torch.testing.assert_close(
+            result.float(), baseline.float(), atol=1e-2, rtol=1e-2
+        )
+
     def test_mxfp4_alpha_contract_validation(self):
         """MXFP4 forbids alphas; other formats require them; nvfp4 rejects MXFP4."""
         from flashinfer import b12x_fused_moe
