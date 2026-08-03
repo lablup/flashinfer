@@ -321,6 +321,45 @@ def get_sparse_mla_sm120_module():
             kv_cache, model_type=model_type, name="kv_cache"
         )
         extra_topk = int(extra_indices.size(-1)) if extra_indices is not None else 0
+        # SM12X-TOPK-PAD: the decode kernels are instantiated only for topk in
+        # {128, 512, 1024}. Widths in between (e.g. 256 for DSv4-Flash's
+        # compressed layers) are padded with -1 (masked) entries up to the next
+        # instantiated width, with topk_length clamping the valid range.
+        if (
+            model_type == _MODEL_TYPE_DSV4
+            and num_tokens <= _DECODE_MAX_TOKENS
+            and kv_pbs == _DECODE_DSV4_PAGE_BLOCK_SIZE
+            and (num_heads, topk) not in _DECODE_DSV4_DISPATCH
+        ):
+            for _cand in (128, 512, 1024):
+                if _cand > topk and (num_heads, _cand) in _DECODE_DSV4_DISPATCH:
+                    if topk_length is None:
+                        topk_length = torch.full(
+                            (num_tokens,),
+                            topk,
+                            dtype=torch.int32,
+                            device=indices.device,
+                        )
+                    _pad = indices.new_full(
+                        (*indices.shape[:-1], _cand - topk), -1
+                    )
+                    indices = torch.cat([indices, _pad], dim=-1).contiguous()
+                    topk = _cand
+                    # SM12X-SCRATCH-GROW: the caller sized mid_out/mid_lse from
+                    # the unpadded topk; regrow them for the padded split count.
+                    _splits = (topk + _BI - 1) // _BI + (
+                        (extra_topk + _BI - 1) // _BI if extra_topk else 0
+                    )
+                    if mid_out is None or mid_out.shape[2] < _splits:
+                        mid_out = q.new_empty(
+                            (num_tokens, num_heads, _splits, d_v),
+                            dtype=torch.bfloat16,
+                        )
+                        mid_lse = q.new_empty(
+                            (num_tokens, num_heads, _splits),
+                            dtype=torch.float32,
+                        )
+                    break
         if (
             model_type == _MODEL_TYPE_DSV4
             and kv_pbs == _DECODE_DSV4_PAGE_BLOCK_SIZE
